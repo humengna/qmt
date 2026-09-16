@@ -84,15 +84,25 @@ def _empty_pairs_frame() -> pd.DataFrame:
     return pd.DataFrame(columns=_PAIR_COLUMNS)
 
 
-def compute_pairwise_stats(
-    up: pd.DataFrame, valid: pd.DataFrame, cfg: MiningConfig,
+def compute_pairwise_stats_asymmetric(
+    leader_up: pd.DataFrame, leader_valid: pd.DataFrame,
+    follower_up: pd.DataFrame, follower_valid: pd.DataFrame,
+    cfg: MiningConfig,
     sector_map: dict[str, str] | None = None,
 ) -> pd.DataFrame:
-    """Two-proportion z-test for every ordered (leader, follower) pair with enough data.
+    """Two-proportion z-test for every ordered (leader, follower) pair, with the leader's
+    "triggered" event and the follower's "outcome" event allowed to be DIFFERENT signals.
+
+    `compute_pairwise_stats(up, valid, cfg)` is the common case of this where the same
+    "up" definition is used on both sides. The asymmetric form exists for hypotheses
+    like limitup's "leader closed AT LIMIT-UP" (a much rarer, more specific event than
+    plain "up") predicting "follower is up" - see limitup/event.py. `leader_up.columns`
+    and `follower_up.columns` may be different universes; only codes present on both
+    sides can ever pair up.
 
     For each pair, compares:
-      group 1: days the leader was up            -> P(follower up `cfg.lag` days later)
-      group 0: days the leader was not up (valid) -> P(follower up `cfg.lag` days later)
+      group 1: days the leader was triggered              -> P(follower outcome `cfg.lag` days later)
+      group 0: days the leader was valid but not triggered -> P(follower outcome `cfg.lag` days later)
     using the standard pooled two-proportion z-test, computed for ALL pairs at once via
     a handful of (N x T) @ (T x N) matrix multiplications rather than a per-pair loop.
 
@@ -112,31 +122,38 @@ def compute_pairwise_stats(
     doing so - see README's mining-diagnostics discussion.
     """
     lag = cfg.lag
-    codes = up.columns.to_numpy()
-    n = len(codes)
-    if n < 2 or len(up) <= lag:
+    leader_codes = leader_up.columns.to_numpy()
+    follower_codes = follower_up.columns.to_numpy()
+    if len(leader_codes) < 1 or len(follower_codes) < 1 or len(leader_up) <= lag:
         return _empty_pairs_frame()
 
-    L = up.iloc[:-lag].to_numpy(dtype=np.float64)       # leader up,   day t
-    VL = valid.iloc[:-lag].to_numpy(dtype=np.float64)   # leader valid, day t
-    F = up.iloc[lag:].to_numpy(dtype=np.float64)        # follower up, day t + lag
-    VF = valid.iloc[lag:].to_numpy(dtype=np.float64)    # follower valid, day t + lag
-    D = VL - L                                          # leader valid but NOT up, day t
+    L = leader_up.iloc[:-lag].to_numpy(dtype=np.float64)         # leader triggered, day t
+    VL = leader_valid.iloc[:-lag].to_numpy(dtype=np.float64)     # leader valid,      day t
+    F = follower_up.iloc[lag:].to_numpy(dtype=np.float64)        # follower outcome,  day t + lag
+    VF = follower_valid.iloc[lag:].to_numpy(dtype=np.float64)    # follower valid,    day t + lag
+    D = VL - L                                                   # leader valid but NOT triggered, day t
 
-    n1 = L.T @ VF   # count: leader up & follower data valid
-    x1 = L.T @ F    # count: leader up & follower up
-    n0 = D.T @ VF   # count: leader flat/down & follower data valid
-    x0 = D.T @ F    # count: leader flat/down & follower up
+    n1 = L.T @ VF   # count: leader triggered & follower data valid
+    x1 = L.T @ F    # count: leader triggered & follower outcome
+    n0 = D.T @ VF   # count: leader valid-not-triggered & follower data valid
+    x0 = D.T @ F    # count: leader valid-not-triggered & follower outcome
 
     if cfg.exclude_same:
-        np.fill_diagonal(n1, 0)
-        np.fill_diagonal(n0, 0)
+        common = set(leader_codes) & set(follower_codes)
+        if common:
+            li_idx = {c: i for i, c in enumerate(leader_codes)}
+            fi_idx = {c: i for i, c in enumerate(follower_codes)}
+            for c in common:
+                n1[li_idx[c], fi_idx[c]] = 0
+                n0[li_idx[c], fi_idx[c]] = 0
 
     same_sector = None
     if sector_map is not None:
-        sectors = np.array([sector_map.get(c) for c in codes], dtype=object)
-        has_sector = sectors != None  # noqa: E711 - vectorized None-check, not identity misuse
-        same_sector = has_sector[:, None] & has_sector[None, :] & (sectors[:, None] == sectors[None, :])
+        leader_sectors = np.array([sector_map.get(c) for c in leader_codes], dtype=object)
+        follower_sectors = np.array([sector_map.get(c) for c in follower_codes], dtype=object)
+        has_l = leader_sectors != None  # noqa: E711
+        has_f = follower_sectors != None  # noqa: E711
+        same_sector = has_l[:, None] & has_f[None, :] & (leader_sectors[:, None] == follower_sectors[None, :])
 
     with np.errstate(divide="ignore", invalid="ignore"):
         p1 = np.divide(x1, n1, out=np.full_like(x1, np.nan), where=n1 > 0)
@@ -147,7 +164,7 @@ def compute_pairwise_stats(
         z = np.divide(p1 - p0, se, out=np.full_like(x1, np.nan), where=se > 0)
 
     lift = p1 - p0
-    pvalue = normal_sf(z)  # one-sided: H1 = "leader up raises the follower's odds"
+    pvalue = normal_sf(z)  # one-sided: H1 = "leader trigger raises the follower's odds"
 
     mask = (n1 >= cfg.min_obs) & (n0 >= cfg.min_obs) & np.isfinite(z)
     if same_sector is not None:
@@ -157,8 +174,8 @@ def compute_pairwise_stats(
         return _empty_pairs_frame()
 
     return pd.DataFrame({
-        "leader": codes[li],
-        "follower": codes[fi],
+        "leader": leader_codes[li],
+        "follower": follower_codes[fi],
         "n_leader_up": n1[li, fi].astype(int),
         "n_leader_flat": n0[li, fi].astype(int),
         "p_cond": p1[li, fi],
@@ -167,6 +184,23 @@ def compute_pairwise_stats(
         "z": z[li, fi],
         "p_value": pvalue[li, fi],
     })
+
+
+def compute_pairwise_stats(
+    up: pd.DataFrame, valid: pd.DataFrame, cfg: MiningConfig,
+    sector_map: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Two-proportion z-test for every ordered (leader, follower) pair with enough data.
+
+    For each pair, compares:
+      group 1: days the leader was up            -> P(follower up `cfg.lag` days later)
+      group 0: days the leader was not up (valid) -> P(follower up `cfg.lag` days later)
+    using the standard pooled two-proportion z-test, computed for ALL pairs at once via
+    a handful of (N x T) @ (T x N) matrix multiplications rather than a per-pair loop.
+    Thin wrapper over `compute_pairwise_stats_asymmetric` for the common case where the
+    leader and follower share the same "up" definition.
+    """
+    return compute_pairwise_stats_asymmetric(up, valid, up, valid, cfg, sector_map)
 
 
 def filter_significant_pairs(stats: pd.DataFrame, cfg: MiningConfig) -> pd.DataFrame:
@@ -222,10 +256,16 @@ def mine_lead_lag_pairs(
     return filter_significant_pairs(compute_pairwise_stats(up, valid, cfg, sector_map), cfg)
 
 
-def validate_out_of_sample(
-    up: pd.DataFrame, valid: pd.DataFrame, candidates: pd.DataFrame, cfg: MiningConfig
+def validate_out_of_sample_asymmetric(
+    leader_up: pd.DataFrame, leader_valid: pd.DataFrame,
+    follower_up: pd.DataFrame, follower_valid: pd.DataFrame,
+    candidates: pd.DataFrame, cfg: MiningConfig,
 ) -> pd.DataFrame:
     """Recompute the same leader/follower statistics on a held-out window.
+
+    Asymmetric counterpart to `validate_out_of_sample`, for when the leader's trigger
+    and the follower's outcome are different signals (see
+    `compute_pairwise_stats_asymmetric`, limitup/event.py).
 
     This is the main defense against data-snooping: with N^2 pairs tested in-sample,
     FDR control bounds the false-discovery rate but does not guarantee any single
@@ -238,8 +278,8 @@ def validate_out_of_sample(
         return candidates.assign(**{c: pd.Series(dtype=float) for c in oos_cols})
 
     lag = cfg.lag
-    up_t, valid_t = up.iloc[:-lag], valid.iloc[:-lag]
-    up_f, valid_f = up.iloc[lag:], valid.iloc[lag:]
+    up_t, valid_t = leader_up.iloc[:-lag], leader_valid.iloc[:-lag]
+    up_f, valid_f = follower_up.iloc[lag:], follower_valid.iloc[lag:]
 
     records = []
     for row in candidates.itertuples(index=False):
@@ -268,6 +308,18 @@ def validate_out_of_sample(
 
     oos = pd.DataFrame(records, columns=oos_cols)
     return pd.concat([candidates.reset_index(drop=True), oos], axis=1)
+
+
+def validate_out_of_sample(
+    up: pd.DataFrame, valid: pd.DataFrame, candidates: pd.DataFrame, cfg: MiningConfig
+) -> pd.DataFrame:
+    """Recompute the same leader/follower statistics on a held-out window.
+
+    Thin wrapper over `validate_out_of_sample_asymmetric` for the common case where the
+    leader and follower share the same "up" definition. See that function's docstring
+    for why this step matters.
+    """
+    return validate_out_of_sample_asymmetric(up, valid, up, valid, candidates, cfg)
 
 
 def filter_oos_significant(
