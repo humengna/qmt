@@ -1,0 +1,9 @@
+# For research/backtest scripts run in a normal Python environment (terminal,
+# venv, Jupyter). The strategy/leadlag_strategy.py file only needs pandas, which
+# QMT's embedded Python interpreter already ships.
+pandas>=1.5
+numpy>=1.23
+
+# Only needed for `--source xtdata`. xtquant ships with the QMT/MiniQMT client;
+# see your vendor's installation instructions rather than a plain `pip install`.
+# xtquant
