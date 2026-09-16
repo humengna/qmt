@@ -31,12 +31,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np
+import pandas as pd
+
 from leadlag import data as ld
 from leadlag.factor import (
     MiningConfig,
+    compute_pairwise_stats,
     compute_returns,
     compute_up_indicator,
-    mine_lead_lag_pairs,
+    filter_significant_pairs,
     select_for_deployment,
     validate_out_of_sample,
 )
@@ -64,7 +68,41 @@ def parse_args():
                     help="live-subscribe budget; see docs/QMT_API_NOTES.md")
     p.add_argument("--min-oos-n", type=int, default=20)
     p.add_argument("--output", default="research/output/pairs.csv")
+    p.add_argument("--no-diagnostics", action="store_true",
+                    help="skip printing the pre-filter lift/z distribution summary")
     return p.parse_args()
+
+
+def print_diagnostics(stats, cfg: MiningConfig) -> None:
+    """Summarize the unfiltered lift/z distribution so a run that finds 0 pairs is
+    distinguishable from 'genuinely no signal' vs 'signal exists but doesn't clear
+    --min-lift/--alpha'. This is the single matrix computation `mine_lead_lag_pairs`
+    would otherwise do internally - just inspected before the strict filtering.
+    """
+    n_pairs = len(stats)
+    print(f"\n--- diagnostics: {n_pairs} pairs cleared --min-obs={cfg.min_obs} in each branch ---")
+    if n_pairs == 0:
+        print("no pair has >= min_obs observations in BOTH the leader-up and "
+              "leader-not-up branches. Lower --min-obs, use a longer history, or "
+              "check the universe actually has usable price history.")
+        return
+
+    lift = stats["lift"].to_numpy()
+    z = stats["z"].to_numpy()
+    qs = [50, 90, 99, 99.9, 100]
+    lift_q = np.percentile(lift, qs)
+    print("lift percentiles (P(follower up | leader up) - P(follower up | leader not up)):")
+    for q, v in zip(qs, lift_q):
+        print(f"  p{q:>5}: {v:+.4f}")
+    print(f"pairs with lift >= --min-lift={cfg.min_lift}: {(lift >= cfg.min_lift).sum()} "
+          f"(before FDR control)")
+
+    top = stats.sort_values("z", ascending=False).head(10)
+    print("top 10 pairs by z-score (NOT FDR-controlled - for inspection only):")
+    with pd.option_context("display.width", 120):
+        print(top[["leader", "follower", "n_leader_up", "p_cond", "p_base", "lift", "z"]]
+              .to_string(index=False))
+    print("--- end diagnostics ---\n")
 
 
 def load_panels(args):
@@ -99,7 +137,10 @@ def main():
 
     up_train, valid_train = compute_up_indicator(train_returns, mode=args.mode, threshold=args.threshold)
     print(f"mining {up_train.shape[1]} symbols x {up_train.shape[0]} train days ...")
-    candidates = mine_lead_lag_pairs(up_train, valid_train, cfg)
+    stats = compute_pairwise_stats(up_train, valid_train, cfg)
+    if not args.no_diagnostics:
+        print_diagnostics(stats, cfg)
+    candidates = filter_significant_pairs(stats, cfg)
     print(f"{len(candidates)} candidate pairs survive FDR-controlled in-sample mining (alpha={cfg.alpha})")
 
     up_test, valid_test = compute_up_indicator(test_returns, mode=args.mode, threshold=args.threshold)

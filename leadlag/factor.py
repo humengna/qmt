@@ -84,14 +84,20 @@ def _empty_pairs_frame() -> pd.DataFrame:
     return pd.DataFrame(columns=_PAIR_COLUMNS)
 
 
-def mine_lead_lag_pairs(up: pd.DataFrame, valid: pd.DataFrame, cfg: MiningConfig) -> pd.DataFrame:
-    """Score every ordered (leader, follower) pair with a two-proportion z-test.
+def compute_pairwise_stats(up: pd.DataFrame, valid: pd.DataFrame, cfg: MiningConfig) -> pd.DataFrame:
+    """Two-proportion z-test for every ordered (leader, follower) pair with enough data.
 
     For each pair, compares:
       group 1: days the leader was up            -> P(follower up `cfg.lag` days later)
       group 0: days the leader was not up (valid) -> P(follower up `cfg.lag` days later)
     using the standard pooled two-proportion z-test, computed for ALL pairs at once via
     a handful of (N x T) @ (T x N) matrix multiplications rather than a per-pair loop.
+
+    Unlike `mine_lead_lag_pairs`, this only applies the `min_obs` sample-size floor -
+    it does NOT filter on `min_lift` or run FDR control. Use it directly (e.g. from a
+    notebook, or the `--diagnostics` output of research/run_mining.py) to inspect the
+    raw lift/z distribution across the whole universe before deciding whether
+    `min_lift`/`alpha` are set sensibly for the data at hand.
     """
     lag = cfg.lag
     codes = up.columns.to_numpy()
@@ -125,12 +131,12 @@ def mine_lead_lag_pairs(up: pd.DataFrame, valid: pd.DataFrame, cfg: MiningConfig
     lift = p1 - p0
     pvalue = normal_sf(z)  # one-sided: H1 = "leader up raises the follower's odds"
 
-    mask = (n1 >= cfg.min_obs) & (n0 >= cfg.min_obs) & np.isfinite(z) & (lift >= cfg.min_lift)
+    mask = (n1 >= cfg.min_obs) & (n0 >= cfg.min_obs) & np.isfinite(z)
     li, fi = np.nonzero(mask)
     if li.size == 0:
         return _empty_pairs_frame()
 
-    out = pd.DataFrame({
+    return pd.DataFrame({
         "leader": codes[li],
         "follower": codes[fi],
         "n_leader_up": n1[li, fi].astype(int),
@@ -142,12 +148,33 @@ def mine_lead_lag_pairs(up: pd.DataFrame, valid: pd.DataFrame, cfg: MiningConfig
         "p_value": pvalue[li, fi],
     })
 
+
+def filter_significant_pairs(stats: pd.DataFrame, cfg: MiningConfig) -> pd.DataFrame:
+    """Narrow `compute_pairwise_stats` output down to economically-meaningful, FDR-significant pairs."""
+    if stats.empty:
+        return stats
+
+    out = stats[stats["lift"] >= cfg.min_lift]
+    if out.empty:
+        return _empty_pairs_frame()
+
     # FDR control is applied within this already effect-size-filtered family (lift >=
     # min_lift), not the full N^2 family: we only ever cared about economically
     # meaningful positive lift, so multiplicity correction is scoped to that subset.
     sig = benjamini_hochberg(out["p_value"].to_numpy(), alpha=cfg.alpha)
     out = out[sig].sort_values("z", ascending=False).reset_index(drop=True)
     return out
+
+
+def mine_lead_lag_pairs(up: pd.DataFrame, valid: pd.DataFrame, cfg: MiningConfig) -> pd.DataFrame:
+    """Compute pairwise stats and filter down to economically-meaningful, FDR-significant pairs.
+
+    Equivalent to `filter_significant_pairs(compute_pairwise_stats(up, valid, cfg), cfg)`;
+    kept as a single call for convenience when you don't need the unfiltered stats too
+    (e.g. research/run_mining.py calls the two halves separately so it can print
+    diagnostics on `stats` before filtering).
+    """
+    return filter_significant_pairs(compute_pairwise_stats(up, valid, cfg), cfg)
 
 
 def validate_out_of_sample(
