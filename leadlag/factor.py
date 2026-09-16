@@ -84,7 +84,10 @@ def _empty_pairs_frame() -> pd.DataFrame:
     return pd.DataFrame(columns=_PAIR_COLUMNS)
 
 
-def compute_pairwise_stats(up: pd.DataFrame, valid: pd.DataFrame, cfg: MiningConfig) -> pd.DataFrame:
+def compute_pairwise_stats(
+    up: pd.DataFrame, valid: pd.DataFrame, cfg: MiningConfig,
+    sector_map: dict[str, str] | None = None,
+) -> pd.DataFrame:
     """Two-proportion z-test for every ordered (leader, follower) pair with enough data.
 
     For each pair, compares:
@@ -98,6 +101,15 @@ def compute_pairwise_stats(up: pd.DataFrame, valid: pd.DataFrame, cfg: MiningCon
     notebook, or the `--diagnostics` output of research/run_mining.py) to inspect the
     raw lift/z distribution across the whole universe before deciding whether
     `min_lift`/`alpha` are set sensibly for the data at hand.
+
+    `sector_map`, if given, restricts consideration to pairs whose leader and follower
+    map to the SAME sector/industry (e.g. `{"600000.SH": "银行", "000001.SZ": "银行", ...}`,
+    typically built by `leadlag.data.build_sector_map_xtdata`). A stock missing from the
+    map is treated as belonging to no sector and can't form a pair with anything. This
+    both targets a more economically plausible hypothesis (co-movement within a sector,
+    not any two arbitrary stocks) and shrinks the multiple-testing family a lot, which
+    is often the difference between everything failing FDR/OOS control and nothing
+    doing so - see README's mining-diagnostics discussion.
     """
     lag = cfg.lag
     codes = up.columns.to_numpy()
@@ -120,6 +132,12 @@ def compute_pairwise_stats(up: pd.DataFrame, valid: pd.DataFrame, cfg: MiningCon
         np.fill_diagonal(n1, 0)
         np.fill_diagonal(n0, 0)
 
+    same_sector = None
+    if sector_map is not None:
+        sectors = np.array([sector_map.get(c) for c in codes], dtype=object)
+        has_sector = sectors != None  # noqa: E711 - vectorized None-check, not identity misuse
+        same_sector = has_sector[:, None] & has_sector[None, :] & (sectors[:, None] == sectors[None, :])
+
     with np.errstate(divide="ignore", invalid="ignore"):
         p1 = np.divide(x1, n1, out=np.full_like(x1, np.nan), where=n1 > 0)
         p0 = np.divide(x0, n0, out=np.full_like(x0, np.nan), where=n0 > 0)
@@ -132,6 +150,8 @@ def compute_pairwise_stats(up: pd.DataFrame, valid: pd.DataFrame, cfg: MiningCon
     pvalue = normal_sf(z)  # one-sided: H1 = "leader up raises the follower's odds"
 
     mask = (n1 >= cfg.min_obs) & (n0 >= cfg.min_obs) & np.isfinite(z)
+    if same_sector is not None:
+        mask = mask & same_sector
     li, fi = np.nonzero(mask)
     if li.size == 0:
         return _empty_pairs_frame()
@@ -188,15 +208,18 @@ def select_top_n_candidates(stats: pd.DataFrame, cfg: MiningConfig, top_n: int) 
     return out.sort_values("z", ascending=False).head(top_n).reset_index(drop=True)
 
 
-def mine_lead_lag_pairs(up: pd.DataFrame, valid: pd.DataFrame, cfg: MiningConfig) -> pd.DataFrame:
+def mine_lead_lag_pairs(
+    up: pd.DataFrame, valid: pd.DataFrame, cfg: MiningConfig,
+    sector_map: dict[str, str] | None = None,
+) -> pd.DataFrame:
     """Compute pairwise stats and filter down to economically-meaningful, FDR-significant pairs.
 
-    Equivalent to `filter_significant_pairs(compute_pairwise_stats(up, valid, cfg), cfg)`;
+    Equivalent to `filter_significant_pairs(compute_pairwise_stats(up, valid, cfg, sector_map), cfg)`;
     kept as a single call for convenience when you don't need the unfiltered stats too
     (e.g. research/run_mining.py calls the two halves separately so it can print
     diagnostics on `stats` before filtering).
     """
-    return filter_significant_pairs(compute_pairwise_stats(up, valid, cfg), cfg)
+    return filter_significant_pairs(compute_pairwise_stats(up, valid, cfg, sector_map), cfg)
 
 
 def validate_out_of_sample(

@@ -102,6 +102,21 @@ def parse_args():
     p.add_argument("--output", default="research/output/pairs.csv")
     p.add_argument("--no-diagnostics", action="store_true",
                     help="skip printing the pre-filter lift/z distribution summary")
+    p.add_argument("--same-sector-only", action="store_true",
+                    help="(xtdata only) only test pairs whose leader and follower map to "
+                         "the same industry/sector, instead of every ordered pair in the "
+                         "universe. Uses --sector-names (or leadlag.data.DEFAULT_SW_L1_SECTORS "
+                         "if not given) to build the mapping. Both targets a more plausible "
+                         "hypothesis (co-movement within a sector) and shrinks the "
+                         "multiple-testing family a lot.")
+    p.add_argument("--sector-names", nargs="*", default=None,
+                    help="sector/industry board names to group by (see --same-sector-only). "
+                         "Must match names in YOUR client's sector tree - use --list-sectors "
+                         "to check before assuming the default list works.")
+    p.add_argument("--list-sectors", nargs="?", const="", default=None, metavar="NODE",
+                    help="(xtdata only) print the sector-tree entries under NODE ('' = top "
+                         "level) and exit, without running any mining. Use this to find the "
+                         "real industry/concept board names in your client.")
     return p.parse_args()
 
 
@@ -162,7 +177,31 @@ def load_panels(args):
 
 def main():
     args = parse_args()
+
+    if args.list_sectors is not None:
+        if args.source != "xtdata":
+            raise SystemExit("--list-sectors requires --source xtdata")
+        sector_names, folder_names = ld.list_sectors_xtdata(args.list_sectors)
+        print(f"sectors under {args.list_sectors!r}: {sector_names}")
+        print(f"folders under {args.list_sectors!r} (pass one as --list-sectors NODE "
+              f"to look deeper): {folder_names}")
+        return
+
     open_px, close_px = load_panels(args)
+
+    sector_map = None
+    if args.same_sector_only:
+        if args.source != "xtdata":
+            raise SystemExit("--same-sector-only requires --source xtdata")
+        sector_names = args.sector_names or ld.DEFAULT_SW_L1_SECTORS
+        sector_map = ld.build_sector_map_xtdata(sector_names)
+        mapped = sum(1 for c in close_px.columns if c in sector_map)
+        print(f"sector map covers {mapped}/{len(close_px.columns)} stocks in the universe "
+              f"({len(set(sector_map.values()))} distinct sectors used)")
+        if mapped < 0.5 * len(close_px.columns):
+            print("WARNING: less than half the universe got a sector assignment - the "
+                  "--sector-names probably don't match your client's actual sector-tree "
+                  "names. Run --list-sectors to find the real ones.")
 
     returns = compute_returns(close_px)
     split = int(len(returns) * args.train_frac)
@@ -175,8 +214,9 @@ def main():
     cfg = MiningConfig(lag=args.lag, min_obs=args.min_obs, alpha=args.alpha, min_lift=args.min_lift)
 
     up_train, valid_train = compute_up_indicator(train_returns, mode=args.mode, threshold=args.threshold)
-    print(f"mining {up_train.shape[1]} symbols x {up_train.shape[0]} train days ...")
-    stats = compute_pairwise_stats(up_train, valid_train, cfg)
+    print(f"mining {up_train.shape[1]} symbols x {up_train.shape[0]} train days "
+          f"{'(same-sector pairs only)' if sector_map else ''}...")
+    stats = compute_pairwise_stats(up_train, valid_train, cfg, sector_map=sector_map)
     if not args.no_diagnostics:
         print_diagnostics(stats, cfg)
 

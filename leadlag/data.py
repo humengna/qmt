@@ -105,6 +105,59 @@ def rank_stocks_by_liquidity_xtdata(
     return ranked[:top_n] if top_n else ranked
 
 
+# Best-effort default for --sector-names: 申万一级行业 (2021 revision) names, which many
+# QMT/xtdata data vendors mirror as sector-tree entries. THIS IS A GUESS, not something
+# verified against your specific broker/data vendor's actual sector list - names can
+# differ (some vendors use 中信行业分类 instead, or prefix/suffix the name differently).
+# build_sector_map_xtdata() prints per-name coverage precisely so a mismatch is obvious
+# rather than silently dropping stocks; use list_sectors_xtdata() to find the real names
+# in your client if the default's coverage looks low.
+DEFAULT_SW_L1_SECTORS = [
+    "农林牧渔", "基础化工", "钢铁", "有色金属", "电子", "汽车", "家用电器", "食品饮料",
+    "纺织服饰", "轻工制造", "医药生物", "公用事业", "交通运输", "房地产", "商贸零售",
+    "社会服务", "银行", "非银金融", "综合", "建筑材料", "建筑装饰", "电力设备",
+    "国防军工", "计算机", "传媒", "通信", "机械设备", "煤炭", "石油石化", "环保", "美容护理",
+]
+
+
+def list_sectors_xtdata(node: str = "") -> tuple[list[str], list[str]]:
+    """List the QMT client's sector-tree entries under `node` ('' = top level).
+
+    Thin wrapper over `xtdata.get_sector_list`, returned as (sector_names, folder_names).
+    A folder name can itself be passed back in as `node` to look one level deeper. Use
+    this to find the exact industry/concept board names your client actually has before
+    relying on DEFAULT_SW_L1_SECTORS or passing your own --sector-names.
+    """
+    from xtquant import xtdata
+
+    info = xtdata.get_sector_list(node)
+    sector_names, folder_names = (info[0], info[1]) if info else ([], [])
+    return list(sector_names), list(folder_names)
+
+
+def build_sector_map_xtdata(sector_names: list[str]) -> dict[str, str]:
+    """Map each stock to the first `sector_names` entry it belongs to.
+
+    Built from `xtdata.get_stock_list_in_sector`, the same call used for the whole-market
+    universe, just pointed at named industry/concept boards instead (see
+    DEFAULT_SW_L1_SECTORS). A stock in more than one of the given sectors is assigned to
+    whichever is listed first - pass a mutually-exclusive classification (like one
+    industry standard's L1 categories) to avoid that ambiguity. Prints per-sector counts
+    so a name that doesn't exist in your client (which quietly returns 0 stocks rather
+    than erroring) is obvious rather than silently shrinking your mapped universe.
+    """
+    from xtquant import xtdata
+
+    mapping: dict[str, str] = {}
+    for sector in sector_names:
+        codes = xtdata.get_stock_list_in_sector(sector)
+        new_codes = [c for c in codes if c not in mapping]
+        for c in new_codes:
+            mapping[c] = sector
+        print(f"[sector] {sector}: {len(codes)} stocks ({len(new_codes)} newly assigned)")
+    return mapping
+
+
 def load_price_panels_csv(close_path: str, open_path: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load wide-format CSVs: a date index column plus one column per stock code."""
     close_panel = pd.read_csv(close_path, index_col=0, parse_dates=True).sort_index()

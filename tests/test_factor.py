@@ -62,6 +62,36 @@ class TestLeadLagMining(unittest.TestCase):
         # relative to the ~40*39 = 1560 ordered pairs tested.
         self.assertLess(len(deployable), 10)
 
+    def test_same_sector_only_excludes_cross_sector_pairs(self):
+        open_px, close_px, injected = make_synthetic_market(
+            n_stocks=40, n_days=800, n_lead_lag_pairs=5, flip_prob=0.45, boost=0.04, seed=5
+        )
+        returns = compute_returns(close_px)
+        up, valid = compute_up_indicator(returns, mode="absolute")
+        cfg = MiningConfig(lag=1, min_obs=50, min_lift=0.0)
+
+        codes = list(close_px.columns)
+        # Split the universe into two disjoint sectors; deliberately put each injected
+        # pair's leader and follower on OPPOSITE sides, so a correct implementation
+        # must find nothing (the "true" cross-sector relationships get filtered out
+        # by construction), while an unfiltered run would find them easily.
+        sector_map = {}
+        for leader, follower in injected:
+            sector_map[leader] = "SECTOR_A"
+            sector_map[follower] = "SECTOR_B"
+        for code in codes:
+            sector_map.setdefault(code, "SECTOR_A" if codes.index(code) % 2 == 0 else "SECTOR_B")
+
+        stats_all = compute_pairwise_stats(up, valid, cfg)
+        stats_grouped = compute_pairwise_stats(up, valid, cfg, sector_map=sector_map)
+
+        self.assertGreater(len(stats_all), len(stats_grouped))
+        for row in stats_grouped.itertuples(index=False):
+            self.assertEqual(sector_map.get(row.leader), sector_map.get(row.follower))
+        # none of the (deliberately cross-sector) injected pairs should survive
+        found = set(zip(stats_grouped["leader"], stats_grouped["follower"]))
+        self.assertFalse(found & set(injected))
+
     def test_oos_sign_check_alone_is_not_a_real_filter(self):
         # Regression test for a real bug found running this pipeline against actual
         # A-share data: --candidate-mode=top-n (or a loose --alpha) can hand the
