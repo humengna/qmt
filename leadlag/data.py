@@ -127,11 +127,25 @@ def list_sectors_xtdata(node: str = "") -> tuple[list[str], list[str]]:
     A folder name can itself be passed back in as `node` to look one level deeper. Use
     this to find the exact industry/concept board names your client actually has before
     relying on DEFAULT_SW_L1_SECTORS or passing your own --sector-names.
+
+    `get_sector_list`'s exact signature/return shape isn't consistent across xtquant
+    versions: some take a `node` path and return `[sector_names, folder_names]`, others
+    take no arguments at all and return a flat list of every sector name. Both are
+    handled here; on the flat-list version, `node` is silently ignored (there is
+    nothing to drill into) and everything comes back as `sector_names` with an empty
+    `folder_names`.
     """
     from xtquant import xtdata
 
-    info = xtdata.get_sector_list(node)
-    sector_names, folder_names = (info[0], info[1]) if info else ([], [])
+    try:
+        info = xtdata.get_sector_list(node)
+    except TypeError:
+        info = xtdata.get_sector_list()
+
+    if info and isinstance(info[0], (list, tuple)):
+        sector_names, folder_names = info[0], info[1]
+    else:
+        sector_names, folder_names = list(info or []), []
     return list(sector_names), list(folder_names)
 
 
