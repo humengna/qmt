@@ -12,6 +12,7 @@ from leadlag.factor import (
     MiningConfig,
     compute_returns,
     compute_up_indicator,
+    filter_oos_significant,
     mine_lead_lag_pairs,
     select_for_deployment,
     validate_out_of_sample,
@@ -33,7 +34,8 @@ class TestBacktest(unittest.TestCase):
         candidates = mine_lead_lag_pairs(up_train, valid_train, cfg)
         up_test, valid_test = compute_up_indicator(test, mode="absolute")
         validated = validate_out_of_sample(up_test, valid_test, candidates, cfg)
-        pairs = select_for_deployment(validated, max_unique_symbols=500, min_oos_n=5)
+        oos_significant = filter_oos_significant(validated, alpha=0.1, min_oos_n=5)
+        pairs = select_for_deployment(oos_significant, max_unique_symbols=500, min_oos_n=5)
         self.assertGreater(len(pairs), 0, "synthetic signal should yield at least one deployable pair")
 
         up_full, _ = compute_up_indicator(returns, mode="absolute")

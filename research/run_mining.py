@@ -17,10 +17,12 @@ Mine on your own wide-format CSV price panels (date index, one column per stock)
         --output research/output/pairs.csv
 
 The pipeline: split history into a train/test window -> mine candidate pairs on the
-train window with FDR control -> re-validate every candidate on the untouched test
-window -> keep only pairs whose lift survives out-of-sample -> trim to a symbol
-budget the live strategy can actually subscribe to. See leadlag/factor.py and
-README.md for why every one of these steps exists.
+train window (FDR-controlled, or rank-based via --candidate-mode=top-n) -> re-test
+every candidate on the untouched test window -> keep only pairs that are themselves
+FDR-significant OUT-OF-SAMPLE (checking just the SIGN of oos_lift is not enough - see
+leadlag.factor.filter_oos_significant) -> trim to a symbol budget the live strategy
+can actually subscribe to. See leadlag/factor.py and README.md for why every one of
+these steps exists.
 """
 from __future__ import annotations
 
@@ -40,6 +42,7 @@ from leadlag.factor import (
     compute_pairwise_stats,
     compute_returns,
     compute_up_indicator,
+    filter_oos_significant,
     filter_significant_pairs,
     select_for_deployment,
     select_top_n_candidates,
@@ -84,6 +87,14 @@ def parse_args():
                     help="candidate count when --candidate-mode=top-n")
     p.add_argument("--alpha", type=float, default=0.01, help="BH-FDR level for in-sample mining")
     p.add_argument("--min-lift", type=float, default=0.05)
+    p.add_argument("--oos-alpha", type=float, default=0.05,
+                    help="BH-FDR level applied to the OUT-OF-SAMPLE p-values. This is the "
+                         "real gate - checking only whether oos_lift is positive lets "
+                         "through ~50%% of pure noise by chance, regardless of how many "
+                         "candidates were tested (this is not hypothetical: it's exactly "
+                         "what a --candidate-mode=top-n or a loose --alpha run against the "
+                         "whole market will otherwise do). Do not disable this.")
+    p.add_argument("--min-oos-lift", type=float, default=0.0)
     p.add_argument("--train-frac", type=float, default=0.7)
     p.add_argument("--max-symbols", type=int, default=500,
                     help="live-subscribe budget; see docs/QMT_API_NOTES.md")
@@ -180,11 +191,18 @@ def main():
 
     up_test, valid_test = compute_up_indicator(test_returns, mode=args.mode, threshold=args.threshold)
     validated = validate_out_of_sample(up_test, valid_test, candidates, cfg)
-    n_survive = ((validated["oos_lift"] > 0) & (validated["oos_n"] >= args.min_oos_n)).sum()
-    print(f"{n_survive} pairs keep a positive lift out-of-sample")
+    n_positive_sign = ((validated["oos_lift"] > 0) & (validated["oos_n"] >= args.min_oos_n)).sum()
+    print(f"{n_positive_sign} pairs merely keep a positive oos_lift sign (NOT a real test - "
+          f"~50% of pure noise passes this by chance; shown only for comparison)")
+
+    oos_significant = filter_oos_significant(
+        validated, alpha=args.oos_alpha, min_oos_lift=args.min_oos_lift, min_oos_n=args.min_oos_n
+    )
+    print(f"{len(oos_significant)} pairs are FDR-significant OUT-OF-SAMPLE "
+          f"(alpha={args.oos_alpha}) -- this is the real gate")
 
     deployable = select_for_deployment(
-        validated, max_unique_symbols=args.max_symbols, min_oos_n=args.min_oos_n
+        oos_significant, max_unique_symbols=args.max_symbols, min_oos_n=args.min_oos_n
     )
     n_symbols = len(set(deployable["leader"]) | set(deployable["follower"])) if len(deployable) else 0
     print(f"{len(deployable)} pairs kept for deployment ({n_symbols} unique symbols, "

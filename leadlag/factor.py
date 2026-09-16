@@ -247,18 +247,45 @@ def validate_out_of_sample(
     return pd.concat([candidates.reset_index(drop=True), oos], axis=1)
 
 
+def filter_oos_significant(
+    validated: pd.DataFrame, alpha: float = 0.05, min_oos_lift: float = 0.0, min_oos_n: int = 20,
+) -> pd.DataFrame:
+    """The real out-of-sample gate: BH-FDR control on `oos_p_value`, not just its sign.
+
+    `validate_out_of_sample` reports `oos_lift` for every candidate, but "oos_lift > 0"
+    alone is a very weak filter: under pure noise, about half of ANY candidate set keeps
+    the same sign out of sample purely by chance, no matter how large the candidate set
+    is. This matters a lot together with `select_top_n_candidates`/a loose `--alpha`,
+    which can hand this function hundreds of thousands of largely-spurious candidates
+    (this combination is exactly what turned up testing this pipeline against a real,
+    whole-market run: ~50.7% of ~250K in-sample "candidates" kept a positive oos_lift,
+    which is indistinguishable from a coin flip and should NOT be read as confirmation).
+    This re-applies proper FDR control on the held-out window's own p-values, so
+    "out-of-sample significant" means an actual statistical test again.
+    """
+    df = validated.dropna(subset=["oos_p_value"])
+    df = df[(df["oos_lift"] >= min_oos_lift) & (df["oos_n"] >= min_oos_n)]
+    if df.empty:
+        return df
+    sig = benjamini_hochberg(df["oos_p_value"].to_numpy(), alpha=alpha)
+    return df[sig].sort_values("oos_z", ascending=False).reset_index(drop=True)
+
+
 def select_for_deployment(
     validated: pd.DataFrame,
     max_unique_symbols: int = 500,
     min_oos_lift: float = 0.0,
     min_oos_n: int = 20,
 ) -> pd.DataFrame:
-    """Keep the strongest out-of-sample pairs, subject to a live-tradable symbol budget.
+    """Trim an already out-of-sample-significant pair table to a live-tradable symbol budget.
 
-    QMT's live/simulated quote subscription (`ContextInfo.get_market_data_ex(subscribe=True)`)
-    caps out at 500 symbols, so the pair table shipped to the live strategy must respect
-    that budget. Greedily adds pairs ranked by out-of-sample z-score until the budget of
-    unique (leader ∪ follower) symbols would be exceeded.
+    Call this AFTER `filter_oos_significant` - it does no significance filtering of its
+    own beyond the `min_oos_lift`/`min_oos_n` sanity floors, it only enforces the symbol
+    budget. QMT's live/simulated quote subscription
+    (`ContextInfo.get_market_data_ex(subscribe=True)`) caps out at 500 symbols, so the
+    pair table shipped to the live strategy must respect that budget. Greedily adds pairs
+    ranked by out-of-sample z-score until the budget of unique (leader ∪ follower)
+    symbols would be exceeded.
     """
     required = {"oos_lift", "oos_z", "oos_n"}
     if not required.issubset(validated.columns):
