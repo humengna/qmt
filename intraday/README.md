@@ -95,5 +95,24 @@ python research/run_intraday_mining.py --source xtdata --top-liquid 300 \
 建议先用 QMT 客户端"数据管理"界面手动下载好标的池的分钟线，原因见上面的数据
 量级警告。
 
+### 真要覆盖全市场？按行业分批跑
+
+全市场 + 多年分钟线一次性跑，大概率装不进内存（见上面的数据量级警告）。因为
+`--same-sector-only` 默认就是同板块内部配对，按申万一级行业拆成 31 次小任务
+跑，不会损失任何统计效力——`research/run_intraday_mining_by_sector.py` 就是
+干这个的：
+
+```bash
+python research/run_intraday_mining_by_sector.py --start 20200101 \
+    --candidate-mode top-n --top-n 30
+```
+
+每个行业单独下载、单独挖掘、单独存日志（`research/output/by_sector/logs/`），
+某个行业跑失败或超时不影响其它行业继续跑；跑完把所有行业的配对合并成一份，并在
+合并后**重新做一次全局的实盘订阅数量上限裁剪**（每个行业单独跑时都各自封顶
+500 只，但 31 个行业合起来很容易超过 500，最终喂给 QMT 实盘脚本的应该是合并后
+再裁剪过的那一份，不是简单拼接）。中途中断了，加 `--skip-existing` 重跑，
+已经跑完的行业不会重新下载。
+
 统计陷阱（多重检验、样本外验证要用真正的 FDR、大盘/板块共振、涨跌停无法成交
 等）跟主 README、`limitup/README.md` 完全一样，这里不重复。
