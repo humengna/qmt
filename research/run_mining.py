@@ -42,6 +42,7 @@ from leadlag.factor import (
     compute_up_indicator,
     filter_significant_pairs,
     select_for_deployment,
+    select_top_n_candidates,
     validate_out_of_sample,
 )
 
@@ -70,6 +71,17 @@ def parse_args():
     p.add_argument("--threshold", type=float, default=0.0)
     p.add_argument("--lag", type=int, default=1)
     p.add_argument("--min-obs", type=int, default=60)
+    p.add_argument("--candidate-mode", choices=["fdr", "top-n"], default="fdr",
+                    help="'fdr' (default) keeps pairs surviving Benjamini-Hochberg at "
+                         "--alpha; at whole-market scale (thousands to millions of pairs "
+                         "tested at once) this routinely rejects everything even when "
+                         "the strongest pairs have real lift, because FDR is calibrated "
+                         "for the WHOLE tested family, not just the top few. 'top-n' "
+                         "skips FDR and just takes the --top-n pairs by z-score, relying "
+                         "on --min-lift plus the mandatory out-of-sample re-check "
+                         "(validate_out_of_sample) to weed out false positives instead.")
+    p.add_argument("--top-n", type=int, default=100,
+                    help="candidate count when --candidate-mode=top-n")
     p.add_argument("--alpha", type=float, default=0.01, help="BH-FDR level for in-sample mining")
     p.add_argument("--min-lift", type=float, default=0.05)
     p.add_argument("--train-frac", type=float, default=0.7)
@@ -156,8 +168,15 @@ def main():
     stats = compute_pairwise_stats(up_train, valid_train, cfg)
     if not args.no_diagnostics:
         print_diagnostics(stats, cfg)
-    candidates = filter_significant_pairs(stats, cfg)
-    print(f"{len(candidates)} candidate pairs survive FDR-controlled in-sample mining (alpha={cfg.alpha})")
+
+    if args.candidate_mode == "fdr":
+        candidates = filter_significant_pairs(stats, cfg)
+        print(f"{len(candidates)} candidate pairs survive FDR-controlled in-sample mining "
+              f"(alpha={cfg.alpha})")
+    else:
+        candidates = select_top_n_candidates(stats, cfg, args.top_n)
+        print(f"{len(candidates)} candidate pairs taken by rank (top-n={args.top_n}, no FDR - "
+              f"out-of-sample validation below is the real filter)")
 
     up_test, valid_test = compute_up_indicator(test_returns, mode=args.mode, threshold=args.threshold)
     validated = validate_out_of_sample(up_test, valid_test, candidates, cfg)

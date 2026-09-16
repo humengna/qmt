@@ -166,6 +166,28 @@ def filter_significant_pairs(stats: pd.DataFrame, cfg: MiningConfig) -> pd.DataF
     return out
 
 
+def select_top_n_candidates(stats: pd.DataFrame, cfg: MiningConfig, top_n: int) -> pd.DataFrame:
+    """Alternative to `filter_significant_pairs`: skip FDR, take the `top_n` pairs by z-score.
+
+    FDR control is the right tool when the in-sample screen IS the final answer. Here it
+    isn't - every candidate this returns must still independently clear
+    `validate_out_of_sample` before ever being deployed. When the universe is large
+    enough that testing a few thousand to a few million pairs at once makes alpha=0.01
+    reject everything (routine at whole-market scale: see docs/QMT_API_NOTES.md and the
+    README's mining-diagnostics discussion), rank-based screening plus a hard
+    out-of-sample re-check is a more practical way to generate candidates worth testing.
+    The trade-off: the CANDIDATE list here has a much higher false-discovery rate than
+    `filter_significant_pairs` would allow - that's expected, and is exactly what
+    `validate_out_of_sample` exists to filter back down.
+    """
+    if stats.empty:
+        return stats
+    out = stats[stats["lift"] >= cfg.min_lift]
+    if out.empty:
+        return _empty_pairs_frame()
+    return out.sort_values("z", ascending=False).head(top_n).reset_index(drop=True)
+
+
 def mine_lead_lag_pairs(up: pd.DataFrame, valid: pd.DataFrame, cfg: MiningConfig) -> pd.DataFrame:
     """Compute pairwise stats and filter down to economically-meaningful, FDR-significant pairs.
 
