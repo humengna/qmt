@@ -105,18 +105,19 @@ def rank_stocks_by_liquidity_xtdata(
     return ranked[:top_n] if top_n else ranked
 
 
-# Best-effort default for --sector-names: 申万一级行业 (2021 revision) names, which many
-# QMT/xtdata data vendors mirror as sector-tree entries. THIS IS A GUESS, not something
-# verified against your specific broker/data vendor's actual sector list - names can
-# differ (some vendors use 中信行业分类 instead, or prefix/suffix the name differently).
-# build_sector_map_xtdata() prints per-name coverage precisely so a mismatch is obvious
-# rather than silently dropping stocks; use list_sectors_xtdata() to find the real names
-# in your client if the default's coverage looks low.
+# Default for --sector-names: 申万一级行业 (2021 revision, 31 industries), verified
+# against a real xtdata sector-tree dump as the "SW1<name>" entries (confirmed present:
+# e.g. 'SW1银行', 'SW1医药生物', 'SW1有色金属', ...). Board naming can still differ across
+# data vendors, so build_sector_map_xtdata() prints per-name coverage regardless - if a
+# name doesn't exist in your client it silently returns 0 stocks rather than erroring,
+# so check that printout, or use list_sectors_xtdata() to find your vendor's real names.
 DEFAULT_SW_L1_SECTORS = [
-    "农林牧渔", "基础化工", "钢铁", "有色金属", "电子", "汽车", "家用电器", "食品饮料",
-    "纺织服饰", "轻工制造", "医药生物", "公用事业", "交通运输", "房地产", "商贸零售",
-    "社会服务", "银行", "非银金融", "综合", "建筑材料", "建筑装饰", "电力设备",
-    "国防军工", "计算机", "传媒", "通信", "机械设备", "煤炭", "石油石化", "环保", "美容护理",
+    "SW1农林牧渔", "SW1基础化工", "SW1钢铁", "SW1有色金属", "SW1电子", "SW1汽车",
+    "SW1家用电器", "SW1食品饮料", "SW1纺织服饰", "SW1轻工制造", "SW1医药生物",
+    "SW1公用事业", "SW1交通运输", "SW1房地产", "SW1商贸零售", "SW1社会服务", "SW1银行",
+    "SW1非银金融", "SW1综合", "SW1建筑材料", "SW1建筑装饰", "SW1电力设备",
+    "SW1国防军工", "SW1计算机", "SW1传媒", "SW1通信", "SW1机械设备", "SW1煤炭",
+    "SW1石油石化", "SW1环保", "SW1美容护理",
 ]
 
 

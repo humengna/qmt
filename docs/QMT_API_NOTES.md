@@ -134,3 +134,14 @@ ContextInfo.get_stock_list_in_sector('沪深A股')   # 或 xtdata.get_stock_list
 
 `research/run_mining.py --source xtdata` 默认板块是 `沪深A股`；北交所股票可以
 加 `京市A股`（第 258、268 页示例里出现过 `沪深京A股` 的写法）。
+
+## 10. 行业板块名称（`--same-sector-only` 用到的板块名，实测得出，不是文档原文）
+
+`get_stock_list_in_sector` 同样能查行业分类，但**板块名称是否存在完全取决于你
+的数据商/客户端配置**，PDF 里没有列出具体行业名单。实测某用户客户端的
+`get_sector_list()` 全量板块名单后发现：申万一级行业(2021版，31个)在这份名单
+里以 `SW1<行业名>` 的形式存在，例如 `SW1银行`、`SW1医药生物`、`SW1有色金属`——
+注意**不是**裸的 `银行`（那样查会返回空列表，`get_stock_list_in_sector` 对不存在
+的板块名不报错，只是静默返回空）。`leadlag/data.py` 的 `DEFAULT_SW_L1_SECTORS`
+已经按这份实测结果更新为 `SW1<行业名>` 格式，但这只保证在测过的那个客户端/数据商
+上有效，换一家可能命名规则完全不同，务必先用 `--list-sectors` 核实。
