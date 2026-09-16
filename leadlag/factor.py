@@ -84,59 +84,27 @@ def _empty_pairs_frame() -> pd.DataFrame:
     return pd.DataFrame(columns=_PAIR_COLUMNS)
 
 
-def compute_pairwise_stats_asymmetric(
-    leader_up: pd.DataFrame, leader_valid: pd.DataFrame,
-    follower_up: pd.DataFrame, follower_valid: pd.DataFrame,
-    cfg: MiningConfig,
-    sector_map: dict[str, str] | None = None,
+def _two_proportion_matrix_stats(
+    L: np.ndarray, VL: np.ndarray, F: np.ndarray, VF: np.ndarray,
+    leader_codes: np.ndarray, follower_codes: np.ndarray,
+    cfg: MiningConfig, sector_map: dict[str, str] | None,
 ) -> pd.DataFrame:
-    """Two-proportion z-test for every ordered (leader, follower) pair, with the leader's
-    "triggered" event and the follower's "outcome" event allowed to be DIFFERENT signals.
+    """Shared core: two-proportion z-test for every (leader, follower) pair, given
+    ALREADY-ALIGNED 0/1 matrices (leader triggered/valid, follower outcome/valid - same
+    row `t` in both means "compare-able", however that alignment was produced upstream).
 
-    `compute_pairwise_stats(up, valid, cfg)` is the common case of this where the same
-    "up" definition is used on both sides. The asymmetric form exists for hypotheses
-    like limitup's "leader closed AT LIMIT-UP" (a much rarer, more specific event than
-    plain "up") predicting "follower is up" - see limitup/event.py. `leader_up.columns`
-    and `follower_up.columns` may be different universes; only codes present on both
-    sides can ever pair up.
-
-    For each pair, compares:
-      group 1: days the leader was triggered              -> P(follower outcome `cfg.lag` days later)
-      group 0: days the leader was valid but not triggered -> P(follower outcome `cfg.lag` days later)
-    using the standard pooled two-proportion z-test, computed for ALL pairs at once via
-    a handful of (N x T) @ (T x N) matrix multiplications rather than a per-pair loop.
-
-    Unlike `mine_lead_lag_pairs`, this only applies the `min_obs` sample-size floor -
-    it does NOT filter on `min_lift` or run FDR control. Use it directly (e.g. from a
-    notebook, or the `--diagnostics` output of research/run_mining.py) to inspect the
-    raw lift/z distribution across the whole universe before deciding whether
-    `min_lift`/`alpha` are set sensibly for the data at hand.
-
-    `sector_map`, if given, restricts consideration to pairs whose leader and follower
-    map to the SAME sector/industry (e.g. `{"600000.SH": "银行", "000001.SZ": "银行", ...}`,
-    typically built by `leadlag.data.build_sector_map_xtdata`). A stock missing from the
-    map is treated as belonging to no sector and can't form a pair with anything. This
-    both targets a more economically plausible hypothesis (co-movement within a sector,
-    not any two arbitrary stocks) and shrinks the multiple-testing family a lot, which
-    is often the difference between everything failing FDR/OOS control and nothing
-    doing so - see README's mining-diagnostics discussion.
+    Used by both `compute_pairwise_stats_asymmetric` (which shifts by `cfg.lag` rows
+    before calling this) and `compute_pairwise_stats_same_row` (whose caller has
+    already baked the lag into a forward-looking `follower_outcome`, e.g. intraday's
+    "did price rise over the next N bars", so no further shift is needed or correct -
+    a lag-based `.iloc[:-lag]` slice on an already-aligned frame is not just redundant,
+    `arr[:-0]` for a same-row lag of 0 would evaluate to an EMPTY slice in numpy/pandas,
+    silently discarding all data).
     """
-    lag = cfg.lag
-    leader_codes = leader_up.columns.to_numpy()
-    follower_codes = follower_up.columns.to_numpy()
-    if len(leader_codes) < 1 or len(follower_codes) < 1 or len(leader_up) <= lag:
-        return _empty_pairs_frame()
-
-    L = leader_up.iloc[:-lag].to_numpy(dtype=np.float64)         # leader triggered, day t
-    VL = leader_valid.iloc[:-lag].to_numpy(dtype=np.float64)     # leader valid,      day t
-    F = follower_up.iloc[lag:].to_numpy(dtype=np.float64)        # follower outcome,  day t + lag
-    VF = follower_valid.iloc[lag:].to_numpy(dtype=np.float64)    # follower valid,    day t + lag
-    D = VL - L                                                   # leader valid but NOT triggered, day t
-
     n1 = L.T @ VF   # count: leader triggered & follower data valid
     x1 = L.T @ F    # count: leader triggered & follower outcome
-    n0 = D.T @ VF   # count: leader valid-not-triggered & follower data valid
-    x0 = D.T @ F    # count: leader valid-not-triggered & follower outcome
+    n0 = VL.T @ VF - n1   # count: leader valid-not-triggered & follower data valid
+    x0 = VL.T @ F - x1    # count: leader valid-not-triggered & follower outcome
 
     if cfg.exclude_same:
         common = set(leader_codes) & set(follower_codes)
@@ -184,6 +152,94 @@ def compute_pairwise_stats_asymmetric(
         "z": z[li, fi],
         "p_value": pvalue[li, fi],
     })
+
+
+def compute_pairwise_stats_asymmetric(
+    leader_up: pd.DataFrame, leader_valid: pd.DataFrame,
+    follower_up: pd.DataFrame, follower_valid: pd.DataFrame,
+    cfg: MiningConfig,
+    sector_map: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Two-proportion z-test for every ordered (leader, follower) pair, with the leader's
+    "triggered" event and the follower's "outcome" event allowed to be DIFFERENT signals,
+    the follower's outcome checked `cfg.lag` ROWS after the leader's (e.g. lag=1 trading
+    day for daily bars - see `compute_pairwise_stats_same_row` for the case where the
+    follower's outcome is already a forward-looking quantity computed at the SAME row).
+
+    `compute_pairwise_stats(up, valid, cfg)` is the common case of this where the same
+    "up" definition is used on both sides. The asymmetric form exists for hypotheses
+    like limitup's "leader closed AT LIMIT-UP" (a much rarer, more specific event than
+    plain "up") predicting "follower is up" - see limitup/event.py. `leader_up.columns`
+    and `follower_up.columns` may be different universes; only codes present on both
+    sides can ever pair up.
+
+    For each pair, compares:
+      group 1: days the leader was triggered              -> P(follower outcome `cfg.lag` days later)
+      group 0: days the leader was valid but not triggered -> P(follower outcome `cfg.lag` days later)
+    using the standard pooled two-proportion z-test, computed for ALL pairs at once via
+    a handful of (N x T) @ (T x N) matrix multiplications rather than a per-pair loop.
+
+    Unlike `mine_lead_lag_pairs`, this only applies the `min_obs` sample-size floor -
+    it does NOT filter on `min_lift` or run FDR control. Use it directly (e.g. from a
+    notebook, or the `--diagnostics` output of research/run_mining.py) to inspect the
+    raw lift/z distribution across the whole universe before deciding whether
+    `min_lift`/`alpha` are set sensibly for the data at hand.
+
+    `sector_map`, if given, restricts consideration to pairs whose leader and follower
+    map to the SAME sector/industry (e.g. `{"600000.SH": "银行", "000001.SZ": "银行", ...}`,
+    typically built by `leadlag.data.build_sector_map_xtdata`). A stock missing from the
+    map is treated as belonging to no sector and can't form a pair with anything. This
+    both targets a more economically plausible hypothesis (co-movement within a sector,
+    not any two arbitrary stocks) and shrinks the multiple-testing family a lot, which
+    is often the difference between everything failing FDR/OOS control and nothing
+    doing so - see README's mining-diagnostics discussion.
+    """
+    lag = cfg.lag
+    leader_codes = leader_up.columns.to_numpy()
+    follower_codes = follower_up.columns.to_numpy()
+    if len(leader_codes) < 1 or len(follower_codes) < 1 or len(leader_up) <= lag:
+        return _empty_pairs_frame()
+
+    L = leader_up.iloc[:-lag].to_numpy(dtype=np.float64)         # leader triggered, day t
+    VL = leader_valid.iloc[:-lag].to_numpy(dtype=np.float64)     # leader valid,      day t
+    F = follower_up.iloc[lag:].to_numpy(dtype=np.float64)        # follower outcome,  day t + lag
+    VF = follower_valid.iloc[lag:].to_numpy(dtype=np.float64)    # follower valid,    day t + lag
+
+    return _two_proportion_matrix_stats(L, VL, F, VF, leader_codes, follower_codes, cfg, sector_map)
+
+
+def compute_pairwise_stats_same_row(
+    leader_triggered: pd.DataFrame, leader_valid: pd.DataFrame,
+    follower_outcome: pd.DataFrame, follower_valid: pd.DataFrame,
+    cfg: MiningConfig,
+    sector_map: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Two-proportion z-test for every ordered (leader, follower) pair, when the
+    follower's "outcome" is already a forward-looking quantity computed at the SAME
+    row as the leader's trigger - e.g. intraday/event.py's "did the follower's price
+    rise from bar t to bar t + N, without crossing into the next trading day", which
+    is indexed by the trigger bar `t` itself, not by `t + N`.
+
+    Do NOT use `compute_pairwise_stats_asymmetric` for this: it additionally shifts by
+    `cfg.lag` rows, which would either double-apply the lag (if `cfg.lag` is set to the
+    same N already baked into `follower_outcome`) or, if you tried to pass `cfg.lag=0`
+    to opt out of the shift, silently return nothing at all (`arr[:-0]` is `arr[:0]`,
+    i.e. empty, in numpy/pandas - not "no slicing").
+
+    Otherwise identical to `compute_pairwise_stats_asymmetric` - see its docstring for
+    `sector_map` and the min_obs-only, no-FDR filtering this applies.
+    """
+    leader_codes = leader_triggered.columns.to_numpy()
+    follower_codes = follower_outcome.columns.to_numpy()
+    if len(leader_codes) < 1 or len(follower_codes) < 1 or len(leader_triggered) == 0:
+        return _empty_pairs_frame()
+
+    L = leader_triggered.to_numpy(dtype=np.float64)
+    VL = leader_valid.to_numpy(dtype=np.float64)
+    F = follower_outcome.to_numpy(dtype=np.float64)
+    VF = follower_valid.to_numpy(dtype=np.float64)
+
+    return _two_proportion_matrix_stats(L, VL, F, VF, leader_codes, follower_codes, cfg, sector_map)
 
 
 def compute_pairwise_stats(
@@ -256,12 +312,38 @@ def mine_lead_lag_pairs(
     return filter_significant_pairs(compute_pairwise_stats(up, valid, cfg, sector_map), cfg)
 
 
+_OOS_COLS = ["oos_p_cond", "oos_p_base", "oos_lift", "oos_z", "oos_p_value", "oos_n"]
+
+
+def _two_proportion_pair_stat(l: np.ndarray, vl: np.ndarray, f: np.ndarray, vf: np.ndarray) -> tuple:
+    """Shared per-pair core for the OOS validators, given already-aligned 0/1 arrays
+    (same alignment convention as `_two_proportion_matrix_stats`, just for one pair
+    at a time via a plain loop rather than a matrix multiply - see the OOS validators'
+    docstrings for why this recomputation is only ever run over a small candidate list).
+    """
+    d = vl - l
+    n1, x1 = float((l * vf).sum()), float((l * f).sum())
+    n0, x0 = float((d * vf).sum()), float((d * f).sum())
+    if n1 <= 0 or n0 <= 0:
+        return (np.nan,) * 6
+
+    p1, p0 = x1 / n1, x0 / n0
+    pooled = (x1 + x0) / (n1 + n0)
+    se = np.sqrt(pooled * (1 - pooled) * (1 / n1 + 1 / n0)) if 0 < pooled < 1 else np.nan
+    z = (p1 - p0) / se if se and se > 0 else np.nan
+    pvalue = float(normal_sf(z)) if np.isfinite(z) else np.nan
+    return (p1, p0, p1 - p0, z, pvalue, n1)
+
+
 def validate_out_of_sample_asymmetric(
     leader_up: pd.DataFrame, leader_valid: pd.DataFrame,
     follower_up: pd.DataFrame, follower_valid: pd.DataFrame,
     candidates: pd.DataFrame, cfg: MiningConfig,
 ) -> pd.DataFrame:
-    """Recompute the same leader/follower statistics on a held-out window.
+    """Recompute the same leader/follower statistics on a held-out window, shifting the
+    follower's outcome by `cfg.lag` rows after the leader's - see
+    `validate_out_of_sample_same_row` for when the follower's outcome is already a
+    forward-looking quantity computed at the same row as the leader.
 
     Asymmetric counterpart to `validate_out_of_sample`, for when the leader's trigger
     and the follower's outcome are different signals (see
@@ -273,9 +355,8 @@ def validate_out_of_sample_asymmetric(
     artifact. Only candidates are recomputed (cheap, a plain Python loop), since by
     this point the candidate list is small.
     """
-    oos_cols = ["oos_p_cond", "oos_p_base", "oos_lift", "oos_z", "oos_p_value", "oos_n"]
     if candidates.empty:
-        return candidates.assign(**{c: pd.Series(dtype=float) for c in oos_cols})
+        return candidates.assign(**{c: pd.Series(dtype=float) for c in _OOS_COLS})
 
     lag = cfg.lag
     up_t, valid_t = leader_up.iloc[:-lag], leader_valid.iloc[:-lag]
@@ -287,26 +368,39 @@ def validate_out_of_sample_asymmetric(
         if leader not in up_t.columns or follower not in up_f.columns:
             records.append((np.nan,) * 6)
             continue
-        l = up_t[leader].to_numpy(dtype=np.float64)
-        vl = valid_t[leader].to_numpy(dtype=np.float64)
-        f = up_f[follower].to_numpy(dtype=np.float64)
-        vf = valid_f[follower].to_numpy(dtype=np.float64)
-        d = vl - l
+        records.append(_two_proportion_pair_stat(
+            up_t[leader].to_numpy(dtype=np.float64), valid_t[leader].to_numpy(dtype=np.float64),
+            up_f[follower].to_numpy(dtype=np.float64), valid_f[follower].to_numpy(dtype=np.float64),
+        ))
 
-        n1, x1 = float((l * vf).sum()), float((l * f).sum())
-        n0, x0 = float((d * vf).sum()), float((d * f).sum())
-        if n1 <= 0 or n0 <= 0:
+    oos = pd.DataFrame(records, columns=_OOS_COLS)
+    return pd.concat([candidates.reset_index(drop=True), oos], axis=1)
+
+
+def validate_out_of_sample_same_row(
+    leader_triggered: pd.DataFrame, leader_valid: pd.DataFrame,
+    follower_outcome: pd.DataFrame, follower_valid: pd.DataFrame,
+    candidates: pd.DataFrame, cfg: MiningConfig,
+) -> pd.DataFrame:
+    """Recompute the same leader/follower statistics on a held-out window, for the
+    same-row-aligned case (see `compute_pairwise_stats_same_row`'s docstring for why
+    this is NOT the same as shifting by `cfg.lag` rows).
+    """
+    if candidates.empty:
+        return candidates.assign(**{c: pd.Series(dtype=float) for c in _OOS_COLS})
+
+    records = []
+    for row in candidates.itertuples(index=False):
+        leader, follower = row.leader, row.follower
+        if leader not in leader_triggered.columns or follower not in follower_outcome.columns:
             records.append((np.nan,) * 6)
             continue
+        records.append(_two_proportion_pair_stat(
+            leader_triggered[leader].to_numpy(dtype=np.float64), leader_valid[leader].to_numpy(dtype=np.float64),
+            follower_outcome[follower].to_numpy(dtype=np.float64), follower_valid[follower].to_numpy(dtype=np.float64),
+        ))
 
-        p1, p0 = x1 / n1, x0 / n0
-        pooled = (x1 + x0) / (n1 + n0)
-        se = np.sqrt(pooled * (1 - pooled) * (1 / n1 + 1 / n0)) if 0 < pooled < 1 else np.nan
-        z = (p1 - p0) / se if se and se > 0 else np.nan
-        pvalue = float(normal_sf(z)) if np.isfinite(z) else np.nan
-        records.append((p1, p0, p1 - p0, z, pvalue, n1))
-
-    oos = pd.DataFrame(records, columns=oos_cols)
+    oos = pd.DataFrame(records, columns=_OOS_COLS)
     return pd.concat([candidates.reset_index(drop=True), oos], axis=1)
 
 
