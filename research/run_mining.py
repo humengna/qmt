@@ -54,6 +54,15 @@ def parse_args():
     p.add_argument("--end", default="")
     p.add_argument("--close-csv")
     p.add_argument("--open-csv")
+    p.add_argument("--top-liquid", type=int, default=None,
+                    help="(xtdata only) shrink the universe to the N stocks with the "
+                         "highest median daily traded value before mining. Cuts O(N^2) "
+                         "compute AND makes the FDR correction much less conservative "
+                         "(fewer pairs tested -> lower bar to clear); see README.")
+    p.add_argument("--no-download", action="store_true",
+                    help="(xtdata only) skip download_history_data and read only the "
+                         "already-cached local data; use this to re-run quickly with "
+                         "different mining parameters after the first full download.")
     p.add_argument("--mode", choices=["absolute", "excess"], default="excess",
                     help="'excess' nets out each day's cross-sectional median return "
                          "before deciding 'up', to avoid mistaking common market moves "
@@ -117,7 +126,14 @@ def load_panels(args):
     if args.source == "xtdata":
         stock_list = ld.get_full_market_stock_list_xtdata(tuple(args.sectors))
         print(f"universe size: {len(stock_list)}")
-        return ld.fetch_price_panels_xtdata(stock_list, start_time=args.start, end_time=args.end)
+        if args.top_liquid:
+            stock_list = ld.rank_stocks_by_liquidity_xtdata(
+                stock_list, start_time=args.start, end_time=args.end, top_n=args.top_liquid
+            )
+            print(f"kept top {len(stock_list)} by median daily traded value")
+        return ld.fetch_price_panels_xtdata(
+            stock_list, start_time=args.start, end_time=args.end, download=not args.no_download
+        )
     raise SystemExit(f"unknown source {args.source}")
 
 

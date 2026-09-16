@@ -79,6 +79,32 @@ def get_full_market_stock_list_xtdata(sectors: tuple[str, ...] = ("沪深A股",)
     return sorted(set(codes))
 
 
+def rank_stocks_by_liquidity_xtdata(
+    stock_list: list[str],
+    start_time: str = "",
+    end_time: str = "",
+    period: str = "1d",
+    top_n: int | None = None,
+) -> list[str]:
+    """Rank a universe by median daily traded value (成交额) and optionally keep the top_n.
+
+    Mining the whole market pays for it twice: O(N^2) compute, and a much stricter
+    FDR bar (the correction gets harsher the more pairs you test at once - see
+    README's "统计陷阱说明"). Shrinking to the most liquid names first cuts both, and
+    also drops names you likely couldn't fill an order in anyway. Reads 'amount' from
+    the already-downloaded local cache, so it doesn't re-trigger any history download.
+    """
+    from xtquant import xtdata
+
+    raw = xtdata.get_market_data_ex(
+        ["amount"], stock_list, period=period, start_time=start_time, end_time=end_time,
+        fill_data=False,
+    )
+    amount = panel_from_field_dict(raw, "amount")
+    ranked = amount.median(axis=0).sort_values(ascending=False).index.tolist()
+    return ranked[:top_n] if top_n else ranked
+
+
 def load_price_panels_csv(close_path: str, open_path: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load wide-format CSVs: a date index column plus one column per stock code."""
     close_panel = pd.read_csv(close_path, index_col=0, parse_dates=True).sort_index()
