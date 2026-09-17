@@ -85,23 +85,46 @@ def rank_stocks_by_liquidity_xtdata(
     end_time: str = "",
     period: str = "1d",
     top_n: int | None = None,
+    download: bool = False,
 ) -> list[str]:
     """Rank a universe by median daily traded value (成交额) and optionally keep the top_n.
 
     Mining the whole market pays for it twice: O(N^2) compute, and a much stricter
     FDR bar (the correction gets harsher the more pairs you test at once - see
     README's "统计陷阱说明"). Shrinking to the most liquid names first cuts both, and
-    also drops names you likely couldn't fill an order in anyway. Reads 'amount' from
-    the already-downloaded local cache, so it doesn't re-trigger any history download.
+    also drops names you likely couldn't fill an order in anyway.
+
+    This reads DAILY bars, which xtdata caches SEPARATELY from the minute bars an
+    intraday pipeline actually mines on: having 5m history locally does NOT mean 1d
+    history is there too, and a missing daily cache silently ranks nothing at all.
+    Pass `download=True` to fetch that daily history first - cheap for a universe small
+    enough to enumerate (a fixed ETF list, one sector), which is why
+    research/run_etf_mining.py does it and the whole-market callers don't.
+
+    Codes with no usable daily data are dropped rather than ranked last, so the
+    returned list only ever contains names actually backed by data.
     """
     from xtquant import xtdata
+
+    if download:
+        for code in stock_list:
+            xtdata.download_history_data(code, period, start_time, end_time)
 
     raw = xtdata.get_market_data_ex(
         ["amount"], stock_list, period=period, start_time=start_time, end_time=end_time,
         fill_data=False,
     )
     amount = panel_from_field_dict(raw, "amount")
-    ranked = amount.median(axis=0).sort_values(ascending=False).index.tolist()
+    ranked = amount.median(axis=0).dropna().sort_values(ascending=False).index.tolist()
+    if not ranked:
+        raise ValueError(
+            f"no usable {period} 'amount' (成交额) data for any of the {len(stock_list)} codes "
+            f"in {start_time or '(open)'}..{end_time or '(open)'}, so there is nothing to rank "
+            f"by liquidity. Liquidity ranking reads DAILY bars, cached separately from the "
+            f"minute bars the mining itself uses - a local 5m history does not imply a local "
+            f"1d history. Re-run with download=True (CLIs: drop --no-download), or download "
+            f"the daily period for these codes in QMT's 数据管理 first."
+        )
     return ranked[:top_n] if top_n else ranked
 
 

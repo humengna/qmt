@@ -169,7 +169,23 @@ def print_diagnostics(stats: pd.DataFrame, cfg: MiningConfig) -> None:
 
 
 def load_panels(args):
-    """Returns (minute_close, minute_suspend, stock_list)."""
+    """Returns (minute_close, minute_suspend, stock_list), refusing to hand back an
+    empty panel: every caller immediately indexes `minute_close.index[0]` to report its
+    train/test split, so an empty result otherwise surfaces as an IndexError from deep
+    inside pandas instead of saying what actually went wrong.
+    """
+    minute_close, minute_suspend, stock_list = _load_panels(args)
+    if minute_close.empty or minute_close.shape[1] == 0:
+        raise SystemExit(
+            f"no {args.period} bars returned for {len(stock_list)} symbol(s) over "
+            f"{args.start or '(open)'}..{args.end or '(open)'}. Check that the date range "
+            f"covers real trading days, and that this period's history is downloaded "
+            f"locally (drop --no-download, or use QMT's 数据管理)."
+        )
+    return minute_close, minute_suspend, stock_list
+
+
+def _load_panels(args):
     if args.source == "synthetic":
         minute_close, minute_suspend, injected = idd.make_synthetic_threshold_market(
             lag_bars=args.lag_bars, threshold=args.leader_threshold,
@@ -186,8 +202,11 @@ def load_panels(args):
     if args.source == "xtdata":
         universe = SYMBOL_LIST
         if args.top_liquid:
+            # download=True: ranking needs DAILY bars, which are cached separately from
+            # the 5m bars this pipeline mines on - see rank_stocks_by_liquidity_xtdata.
             universe = ld.rank_stocks_by_liquidity_xtdata(
-                universe, start_time=args.start, end_time=args.end, top_n=args.top_liquid
+                universe, start_time=args.start, end_time=args.end, top_n=args.top_liquid,
+                download=not args.no_download,
             )
             print(f"kept top {len(universe)} of {len(SYMBOL_LIST)} ETFs by median daily traded value")
         minute_close, minute_suspend, _daily_close = idd.fetch_intraday_panels_xtdata(

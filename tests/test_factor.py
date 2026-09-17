@@ -154,6 +154,77 @@ class TestLeadLagMining(unittest.TestCase):
         self.assertLessEqual(len(pairs_exc), len(pairs_abs))
 
 
+class TestLiquidityRanking(unittest.TestCase):
+    """Covers a real failure hit against a live QMT terminal: `--top-liquid` silently
+    ranked 0 of 85 ETFs (then blew up with an IndexError downstream) because liquidity
+    ranking reads DAILY bars, which xtdata caches separately from the 5m bars the
+    intraday pipelines download and mine on.
+    """
+
+    def _stub_xtdata(self, amount_by_code):
+        import sys
+        import types
+        from unittest import mock
+
+        calls = []
+
+        def get_market_data_ex(fields, stock_list, period="1d", start_time="", end_time="", **kwargs):
+            # real xtdata indexes daily frames by "YYYYMMDD"-style stamps, which
+            # panel_from_field_dict parses with pd.to_datetime
+            return {
+                code: pd.DataFrame(
+                    {"amount": values},
+                    index=[f"2024010{i + 1}" for i in range(len(values))],
+                )
+                for code, values in amount_by_code.items() if code in set(stock_list)
+            }
+
+        def download_history_data(code, period, start_time="", end_time=""):
+            calls.append((code, period))
+
+        xtdata = types.SimpleNamespace(
+            get_market_data_ex=get_market_data_ex, download_history_data=download_history_data,
+        )
+        module = types.ModuleType("xtquant")
+        module.xtdata = xtdata
+        return mock.patch.dict(sys.modules, {"xtquant": module}), calls
+
+    def test_ranks_by_median_traded_value_and_can_prefetch_daily_bars(self):
+        from leadlag.data import rank_stocks_by_liquidity_xtdata
+
+        patcher, calls = self._stub_xtdata({
+            "A.SH": [1.0, 3.0, 2.0],      # median 2
+            "B.SH": [50.0, 70.0, 60.0],   # median 60
+            "C.SZ": [10.0, 10.0, 10.0],   # median 10
+        })
+        with patcher:
+            ranked = rank_stocks_by_liquidity_xtdata(
+                ["A.SH", "B.SH", "C.SZ"], top_n=2, download=True
+            )
+        self.assertEqual(ranked, ["B.SH", "C.SZ"])
+        self.assertEqual([c for c, _ in calls], ["A.SH", "B.SH", "C.SZ"])
+        self.assertTrue(all(period == "1d" for _, period in calls))
+
+    def test_codes_without_daily_data_are_dropped_not_ranked_last(self):
+        from leadlag.data import rank_stocks_by_liquidity_xtdata
+
+        patcher, _ = self._stub_xtdata({
+            "A.SH": [5.0, 5.0],
+            "B.SH": [float("nan"), float("nan")],
+        })
+        with patcher:
+            ranked = rank_stocks_by_liquidity_xtdata(["A.SH", "B.SH"], top_n=2)
+        self.assertEqual(ranked, ["A.SH"])
+
+    def test_empty_daily_cache_raises_an_actionable_error(self):
+        from leadlag.data import rank_stocks_by_liquidity_xtdata
+
+        patcher, _ = self._stub_xtdata({})  # nothing cached at all
+        with patcher, self.assertRaises(ValueError) as ctx:
+            rank_stocks_by_liquidity_xtdata(["A.SH", "B.SH"], top_n=2)
+        self.assertIn("DAILY", str(ctx.exception))
+
+
 class TestExcludeHubFollowers(unittest.TestCase):
     def _pairs(self, rows):
         return pd.DataFrame(rows, columns=["leader", "follower"])
