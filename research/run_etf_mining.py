@@ -50,6 +50,7 @@ from intraday.event import build_follower_frames, build_leader_frames_threshold
 from leadlag.factor import (
     MiningConfig,
     compute_pairwise_stats_same_row,
+    exclude_hub_followers,
     filter_oos_significant,
     filter_significant_pairs,
     select_for_deployment,
@@ -120,6 +121,16 @@ def parse_args():
     p.add_argument("--train-frac", type=float, default=0.7)
     p.add_argument("--max-symbols", type=int, default=500)
     p.add_argument("--min-oos-n", type=int, default=10)
+    p.add_argument("--max-leaders-per-follower", type=int, default=3,
+                    help="drop any follower paired with more than this many distinct "
+                         "leaders among the OOS-significant pairs, before the symbol-"
+                         "budget cap (0 disables). This ETF universe is small and highly "
+                         "homogeneous (85 cross-border/commodity/bond names), so a "
+                         "follower 'significant' against a dozen+ unrelated leaders at "
+                         "once is much more likely to be a high-beta name riding a "
+                         "shared factor excess-mode didn't fully net out, than a dozen+ "
+                         "genuine per-leader relationships - see "
+                         "leadlag.factor.exclude_hub_followers's docstring.")
     p.add_argument("--output", default="research/output/etf_pairs.csv")
     p.add_argument("--no-diagnostics", action="store_true")
     return p.parse_args()
@@ -222,8 +233,16 @@ def main():
     print(f"{len(oos_significant)} pairs are FDR-significant OUT-OF-SAMPLE "
           f"(alpha={args.oos_alpha}) -- this is the real gate")
 
+    deduped = exclude_hub_followers(oos_significant, args.max_leaders_per_follower)
+    n_hub_followers = len(set(oos_significant["follower"]) - set(deduped["follower"])) if len(oos_significant) else 0
+    if n_hub_followers:
+        print(f"excluded {n_hub_followers} 'hub' follower(s) paired with more than "
+              f"--max-leaders-per-follower={args.max_leaders_per_follower} distinct "
+              f"leaders ({len(oos_significant) - len(deduped)} pairs dropped) - likely "
+              f"shared-factor/beta exposure, not a real per-leader relationship")
+
     deployable = select_for_deployment(
-        oos_significant, max_unique_symbols=args.max_symbols, min_oos_n=args.min_oos_n
+        deduped, max_unique_symbols=args.max_symbols, min_oos_n=args.min_oos_n
     )
     n_symbols = len(set(deployable["leader"]) | set(deployable["follower"])) if len(deployable) else 0
     print(f"{len(deployable)} pairs kept for deployment ({n_symbols} unique symbols, "

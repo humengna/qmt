@@ -4,11 +4,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pandas as pd
+
 from leadlag.data import make_synthetic_market
 from leadlag.factor import (
     MiningConfig,
     compute_returns,
     compute_up_indicator,
+    exclude_hub_followers,
     filter_oos_significant,
     mine_lead_lag_pairs,
     select_for_deployment,
@@ -149,6 +152,41 @@ class TestLeadLagMining(unittest.TestCase):
         pairs_abs = mine_lead_lag_pairs(up_abs, valid_abs, cfg)
         pairs_exc = mine_lead_lag_pairs(up_exc, valid_exc, cfg)
         self.assertLessEqual(len(pairs_exc), len(pairs_abs))
+
+
+class TestExcludeHubFollowers(unittest.TestCase):
+    def _pairs(self, rows):
+        return pd.DataFrame(rows, columns=["leader", "follower"])
+
+    def test_drops_follower_tied_to_too_many_distinct_leaders(self):
+        # HUB is paired with 4 distinct leaders (> max=3); NORMAL only ever has 1.
+        rows = [
+            {"leader": "L1", "follower": "HUB"}, {"leader": "L2", "follower": "HUB"},
+            {"leader": "L3", "follower": "HUB"}, {"leader": "L4", "follower": "HUB"},
+            {"leader": "L5", "follower": "NORMAL"},
+        ]
+        out = exclude_hub_followers(self._pairs(rows), max_leaders_per_follower=3)
+        self.assertNotIn("HUB", set(out["follower"]))
+        self.assertIn("NORMAL", set(out["follower"]))
+        self.assertEqual(len(out), 1)
+
+    def test_follower_at_exactly_the_limit_is_kept(self):
+        rows = [
+            {"leader": "L1", "follower": "F"}, {"leader": "L2", "follower": "F"},
+            {"leader": "L3", "follower": "F"},
+        ]
+        out = exclude_hub_followers(self._pairs(rows), max_leaders_per_follower=3)
+        self.assertEqual(len(out), 3)
+
+    def test_zero_disables_the_filter(self):
+        rows = [{"leader": f"L{i}", "follower": "HUB"} for i in range(20)]
+        out = exclude_hub_followers(self._pairs(rows), max_leaders_per_follower=0)
+        self.assertEqual(len(out), 20)
+
+    def test_empty_input_is_a_no_op(self):
+        empty = self._pairs([])
+        out = exclude_hub_followers(empty, max_leaders_per_follower=3)
+        self.assertTrue(out.empty)
 
 
 if __name__ == "__main__":

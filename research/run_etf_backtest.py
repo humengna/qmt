@@ -33,6 +33,16 @@ def parse_args():
     p.add_argument("--end", default="")
     p.add_argument("--top-k", type=int, default=5)
     p.add_argument("--initial-capital", type=float, default=1_000_000.0)
+    p.add_argument("--commission-bps", type=float, default=3.0,
+                    help="per side, in bps of trade value (IntradayBacktestConfig default: 3.0)")
+    p.add_argument("--slippage-bps", type=float, default=10.0,
+                    help="per side (IntradayBacktestConfig default: 10.0). Lower this to test "
+                         "whether a negative backtest is purely a cost-assumption artifact, "
+                         "e.g. --slippage-bps 0 --commission-bps 0 --stamp-tax-bps 0 isolates "
+                         "the gross (no-cost) result the same way as diffing trades.csv's "
+                         "'pnl' column against raw entry/exit price differences.")
+    p.add_argument("--stamp-tax-bps", type=float, default=5.0,
+                    help="sell side only, A-share stamp duty (IntradayBacktestConfig default: 5.0)")
     p.add_argument("--equity-csv", default="research/output/etf_equity_curve.csv")
     p.add_argument("--trades-csv", default="research/output/etf_trades.csv",
                     help="per-trade log; inspect this first when the equity curve is "
@@ -98,6 +108,7 @@ def main():
 
     cfg = IntradayBacktestConfig(
         lag_bars=meta["lag_bars"], top_k=args.top_k, initial_capital=args.initial_capital,
+        commission_bps=args.commission_bps, slippage_bps=args.slippage_bps, stamp_tax_bps=args.stamp_tax_bps,
     )
     equity, trades = simulate_intraday_portfolio(score, minute_close, cfg)
 

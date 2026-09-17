@@ -83,6 +83,52 @@ ETF 等）——这些品种：
 持仓，日内波动天然比个股小得多，1% 在真实 ETF 上本来就应该是一个有信息量的
 稀有事件，合成数据的噪声尺度是照这个直觉调的，不是随便选的。
 
+### 真实数据跑出来的教训：样本外显著 ≠ 扣完成本能赚钱（这次证据更直接）
+
+用户在真实 xtdata 上跑通了一次全流程（85 只 ETF，样本外测试窗口约 8 个月，
+5 分钟 K 线），挖出 10 组样本外 FDR 显著的 pairs，回测结果却是全面负收益
+（total_return -27%，全部 8 个 follower 无一例外都亏钱）。逐笔拆解
+（`etf_trades.csv` 的 `pnl` 列是扣成本后的净值，用买卖价差反推毛收益）发现
+两件事，都不是"随机噪声"或"统计方法有bug"：
+
+1. **毛利（不含成本）其实是正的**，方向和挖掘阶段找到的完全一致——不是伪发现，
+   也不是方向反了。但毛利太薄：换算成基点，每笔交易平均毛收益只有十几个bp，
+   而回测默认成本假设（佣金3bp+滑点10bp每边、卖出再加印花税5bp）一来一回
+   要吃掉约 31bp，边际比成本还小，怎么调都补不回来。
+2. **少数几个 follower（比如某几只港股/纳指相关的 ETF）反复出现，同时对应
+   十几个不同的 leader**——这不像是"A带动B"式的一对一关系，更像是这几个
+   follower 本身对全池子共享的因子（隔夜海外市场/商品价格波动）beta 特别高，
+   只要池子里随便哪个成分先冲了阈值（往往意味着共同因子已经在动），这几个
+   高beta名字随后大概率也会涨。85 只标的本身高度同质（都是跨境/商品/债券
+   ETF），`mode='excess'` 用这 85 只自己的截面中位数去剔除共同因子，对这种
+   高beta名字剔不干净——被误判成了"对每个 leader 的独立响应"。
+
+针对这两点分别加了诊断/防护手段：
+
+**成本敏感性**：`run_etf_backtest.py` 新增 `--commission-bps`/`--slippage-bps`
+/`--stamp-tax-bps`，可以覆盖 `IntradayBacktestConfig` 的默认值，用来验证
+"扣掉成本才由正转负"这个判断，而不用改代码：
+
+```bash
+python research/run_etf_backtest.py --pairs research/output/etf_pairs.csv --source xtdata \
+    --start 20220101 --end 20240601 --commission-bps 0 --slippage-bps 0 --stamp-tax-bps 0
+```
+
+**hub follower 排除**：`leadlag.factor.exclude_hub_followers(pairs, max_leaders_per_follower)`
+——在样本外 FDR 通过之后、进实盘符号预算裁剪之前，把"对应了超过
+`max_leaders_per_follower` 个不同 leader"的 follower 整个剔除（`=0` 关闭这个
+过滤）。`run_etf_mining.py` 默认 `--max-leaders-per-follower=3`：
+
+```bash
+python research/run_etf_mining.py --source xtdata --start 20220101 --end 20240601 \
+    --max-leaders-per-follower 3 --output research/output/etf_pairs.csv
+```
+
+这只是一个粗粒度的、单变量的安全阀，不会真的把共同因子从数据里剔除干净——
+真要根治，需要在算 follower 的 forward outcome 时先对某个基准做 beta 回归、
+只保留残差（比现在改动大得多，暂未实现）。当前这一步只是防止继续把"共同
+因子驱动的伪配对"当成真实的逐对领先滞后关系送进实盘。
+
 ## 数据量级警告（务必先读）
 
 分钟线数据量比日线大得多：一个完整交易日约 240 根 1 分钟 K 线 / 48 根 5 分钟

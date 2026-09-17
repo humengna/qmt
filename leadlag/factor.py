@@ -473,3 +473,38 @@ def select_for_deployment(
         keep_rows.append(row)
 
     return pd.DataFrame(keep_rows, columns=df.columns).reset_index(drop=True)
+
+
+def exclude_hub_followers(pairs: pd.DataFrame, max_leaders_per_follower: int) -> pd.DataFrame:
+    """Drop any follower that shows up paired with MORE than `max_leaders_per_follower`
+    distinct leaders in `pairs`.
+
+    A follower that is "significant" against a dozen+ unrelated leaders at once is a red
+    flag for an unremoved common factor, not a dozen+ genuine pairwise relationships: it
+    means that follower is simply high-beta to whatever shared factor moves the whole
+    universe (any leader crossing its trigger threshold tends to coincide with days the
+    shared factor is active), not specifically driven by any one leader. This showed up
+    concretely running the T0-ETF pipeline (research/run_etf_mining.py) against real
+    data on a small, highly homogeneous universe (85 cross-border/commodity/bond ETFs):
+    a handful of followers were paired with 10+ different leaders each, and excess-mode's
+    cross-sectional median (over just that same homogeneous 85-name universe) evidently
+    didn't fully net out the shared factor those high-beta names ride on.
+
+    `max_leaders_per_follower=0` disables this (returns `pairs` unchanged) - use it when
+    a follower genuinely responding to several distinct leaders is plausible for the
+    universe at hand (e.g. a large, diverse full-market universe where a handful of
+    independent sector leaders driving one liquid bellwether follower isn't suspicious
+    the way it is in a small, homogeneous universe).
+
+    This is a coarse, univariate safeguard - it doesn't attempt to model or remove the
+    common factor itself (see `compute_up_indicator`'s `mode='excess'` for that), just
+    refuses to deploy a pair where "how many other leaders also point at this follower"
+    already contradicts the story of a pairwise relationship.
+    """
+    if max_leaders_per_follower <= 0 or pairs.empty:
+        return pairs
+    counts = pairs.groupby("follower")["leader"].nunique()
+    hub_followers = set(counts[counts > max_leaders_per_follower].index)
+    if not hub_followers:
+        return pairs
+    return pairs[~pairs["follower"].isin(hub_followers)].reset_index(drop=True)
