@@ -32,22 +32,23 @@ from leadlag.data import panel_from_field_dict
 from limitup.data import limit_pct_for_code
 
 
-def fetch_intraday_panels_xtdata(
+def fetch_intraday_close_panels_xtdata(
     stock_list: list[str], start_time: str = "", end_time: str = "", period: str = "5m",
     download: bool = True,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Fetch minute-bar close + suspend-flag panels, plus the DAILY close series needed
-    to compute each day's limit price (fixed for the whole day, based on the PRIOR
-    trading day's close - not something you can derive from intraday bars alone).
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fetch ONLY the minute-bar close + suspend-flag panels - no daily bars at all.
+
+    This is what a purely intraday hypothesis needs (e.g. the T0-ETF threshold trigger,
+    `intraday.event.build_leader_frames_threshold`, whose day-anchor is that day's own
+    first BAR). Use `fetch_intraday_panels_xtdata` instead only when you also need the
+    daily closes the limit-up trigger's price arithmetic depends on.
 
     Minute-bar data volume is much larger than daily: a full trading day is ~240
     one-minute bars (48 five-minute bars). Scope `stock_list` and the date range down
     (few hundred liquid/active names, months rather than years) before running this
     against the whole market - see intraday/README.md.
 
-    Returns (minute_close, minute_suspend_flag, daily_close), all UNADJUSTED
-    (dividend_type='none') since limit-price arithmetic needs raw price levels (see
-    limitup.data's fetch function for the same reasoning).
+    Panels are UNADJUSTED (dividend_type='none'), matching the rest of this package.
     """
     from xtquant import xtdata
 
@@ -61,15 +62,83 @@ def fetch_intraday_panels_xtdata(
         ["close", "suspendFlag"], stock_list, period=period,
         start_time=start_time, end_time=end_time, dividend_type="none", fill_data=False,
     )
-    minute_close = panel_from_field_dict(minute_raw, "close")
-    minute_suspend = panel_from_field_dict(minute_raw, "suspendFlag")
+    return panel_from_field_dict(minute_raw, "close"), panel_from_field_dict(minute_raw, "suspendFlag")
 
+
+def fetch_intraday_panels_xtdata(
+    stock_list: list[str], start_time: str = "", end_time: str = "", period: str = "5m",
+    download: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Fetch minute-bar close + suspend-flag panels, plus the DAILY close series needed
+    to compute each day's limit price (fixed for the whole day, based on the PRIOR
+    trading day's close - not something you can derive from intraday bars alone).
+
+    Only the LIMIT-UP trigger needs that daily series; a threshold-based intraday
+    trigger doesn't, and should call `fetch_intraday_close_panels_xtdata` so it never
+    depends on the daily cache (xtdata caches daily and minute bars separately - having
+    5m history locally does NOT mean 1d history is there too).
+
+    Returns (minute_close, minute_suspend_flag, daily_close), all UNADJUSTED
+    (dividend_type='none') since limit-price arithmetic needs raw price levels (see
+    limitup.data's fetch function for the same reasoning).
+    """
+    from xtquant import xtdata
+
+    minute_close, minute_suspend = fetch_intraday_close_panels_xtdata(
+        stock_list, start_time=start_time, end_time=end_time, period=period, download=download,
+    )
     daily_raw = xtdata.get_market_data_ex(
         ["close"], stock_list, period="1d",
         start_time=start_time, end_time=end_time, dividend_type="none", fill_data=False,
     )
     daily_close = panel_from_field_dict(daily_raw, "close")
     return minute_close, minute_suspend, daily_close
+
+
+def rank_by_intraday_turnover_xtdata(
+    stock_list: list[str], start_time: str = "", end_time: str = "", period: str = "5m",
+    top_n: int | None = None, download: bool = True,
+) -> list[str]:
+    """Rank a universe by median daily turnover RECONSTRUCTED FROM MINUTE BARS: sum each
+    trading day's 'amount' (成交额) across that day's bars, then take the median across days.
+
+    Same purpose as `leadlag.data.rank_stocks_by_liquidity_xtdata` - shrink the universe
+    to names an order could actually be filled in, before paying O(N^2) mining cost and a
+    harsher FDR bar - but reads the SAME minute period the pipeline mines on, so an
+    intraday study needs no daily bars cached at all. That distinction is not academic:
+    ranking off daily bars silently returned nothing for a fixed ETF list whose 5m
+    history was fully downloaded but whose 1d history had never been fetched.
+
+    A day whose bars are entirely missing stays NaN rather than summing to 0, so a name
+    that was suspended or not yet listed for part of the window isn't ranked as if it
+    had traded zero on those days.
+    """
+    from xtquant import xtdata
+
+    if download:
+        for i, code in enumerate(stock_list, 1):
+            xtdata.download_history_data(code, period, start_time, end_time)
+            if i % 100 == 0 or i == len(stock_list):
+                print(f"[xtdata] downloaded {i}/{len(stock_list)} ({period} bars, for liquidity ranking)")
+
+    raw = xtdata.get_market_data_ex(
+        ["amount"], stock_list, period=period, start_time=start_time, end_time=end_time,
+        dividend_type="none", fill_data=False,
+    )
+    amount = panel_from_field_dict(raw, "amount")
+    ranked = []
+    if not amount.empty:
+        daily_turnover = amount.groupby(amount.index.normalize()).sum(min_count=1)
+        ranked = daily_turnover.median(axis=0).dropna().sort_values(ascending=False).index.tolist()
+    if not ranked:
+        raise ValueError(
+            f"no usable {period} 'amount' (成交额) data for any of the {len(stock_list)} codes in "
+            f"{start_time or '(open)'}..{end_time or '(open)'}, so there is nothing to rank by "
+            f"liquidity. Re-run with download=True (CLIs: drop --no-download) so the {period} "
+            f"history is fetched first, or skip the ranking entirely (CLIs: drop --top-liquid) "
+            f"to mine the whole universe."
+        )
+    return ranked[:top_n] if top_n else ranked
 
 
 def broadcast_prev_close_to_bars(minute_index: pd.DatetimeIndex, daily_close: pd.DataFrame) -> pd.DataFrame:

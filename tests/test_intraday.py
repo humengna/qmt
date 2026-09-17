@@ -226,6 +226,66 @@ class TestEtfBacktest(unittest.TestCase):
         self.assertGreater(summary["sharpe"], 0)
 
 
+class TestIntradayTurnoverRanking(unittest.TestCase):
+    """The ETF pipeline must stay purely minute-level: its universe selection ranks by
+    turnover summed from the SAME minute bars it mines on, never from daily bars (which
+    xtdata caches separately - ranking off 1d silently returned nothing for a fixed ETF
+    list whose 5m history was fully downloaded).
+    """
+
+    def _stub_xtdata(self, amount_by_code, bars_per_day=2, n_days=3):
+        import sys
+        import types
+        from unittest import mock
+
+        periods_seen = []
+
+        def get_market_data_ex(fields, stock_list, period="5m", start_time="", end_time="", **kwargs):
+            periods_seen.append(period)
+            stamps = [
+                f"2024010{d + 1}10{b:02d}00"
+                for d in range(n_days) for b in range(bars_per_day)
+            ]
+            return {
+                code: pd.DataFrame({"amount": values}, index=stamps)
+                for code, values in amount_by_code.items() if code in set(stock_list)
+            }
+
+        def download_history_data(code, period, start_time="", end_time=""):
+            periods_seen.append(period)
+
+        module = types.ModuleType("xtquant")
+        module.xtdata = types.SimpleNamespace(
+            get_market_data_ex=get_market_data_ex, download_history_data=download_history_data,
+        )
+        return mock.patch.dict(sys.modules, {"xtquant": module}), periods_seen
+
+    def test_ranks_on_minute_bars_only_never_daily(self):
+        from intraday.data import rank_by_intraday_turnover_xtdata
+
+        # 3 days x 2 bars; per-day turnover is the SUM of that day's bars
+        patcher, periods_seen = self._stub_xtdata({
+            "BIG.SH": [100.0, 100.0, 100.0, 100.0, 100.0, 100.0],   # 200/day
+            "MID.SZ": [10.0, 40.0, 10.0, 40.0, 10.0, 40.0],         # 50/day
+            "SMALL.SH": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],             # 2/day
+        })
+        with patcher:
+            ranked = rank_by_intraday_turnover_xtdata(
+                ["BIG.SH", "MID.SZ", "SMALL.SH"], period="5m", top_n=2, download=True
+            )
+        self.assertEqual(ranked, ["BIG.SH", "MID.SZ"])
+        self.assertTrue(periods_seen)
+        self.assertNotIn("1d", periods_seen, f"daily bars must never be touched, saw {periods_seen}")
+
+    def test_empty_minute_cache_raises_an_actionable_error(self):
+        from intraday.data import rank_by_intraday_turnover_xtdata
+
+        patcher, _ = self._stub_xtdata({})
+        with patcher, self.assertRaises(ValueError) as ctx:
+            rank_by_intraday_turnover_xtdata(["A.SH"], period="5m", top_n=1, download=False)
+        self.assertIn("--top-liquid", str(ctx.exception))
+
+
 class TestEtfParamSweep(unittest.TestCase):
     def test_run_one_combo_recovers_pairs_at_the_matching_lag(self):
         from types import SimpleNamespace

@@ -162,6 +162,18 @@ python research/run_etf_param_sweep.py --source xtdata --start 20200101 --end 20
 风险，也让回测里那个"每边固定10bp滑点"的假设对剩下的名字更贴近现实（真实
 交易量小的名字，滑点大概率比这个假设更差，不是更好）。
 
+**排序也是分钟级的**：`intraday.data.rank_by_intraday_turnover_xtdata` 把每
+个交易日内所有分钟K线的 `amount`（成交额）加总成当日成交额、再取跨日中位数
+来排名，读的是这条链路本来就要挖的那份分钟数据，**整条 ETF 链路不读任何日线**
+（`fetch_intraday_close_panels_xtdata` 只拉分钟 close/suspendFlag；只有涨停
+触发版才需要日线收盘价去算涨停价，走的是 `fetch_intraday_panels_xtdata`）。
+
+这个区别不是洁癖：xtdata 的日线和分钟线是**分开缓存**的，本地有 5m 不代表本
+地有 1d。第一版 `--top-liquid` 复用了 `leadlag` 那个按日线成交额排序的函数，
+结果在只下载过 5m 的 ETF 池上静默地排出 0 只（`kept top 0 of 85`），股票池被
+清空后才在后面炸出一个看不出所以然的 IndexError。现在排序读分钟线、排不出来
+时直接报错说明原因，`load_panels` 也会在面板为空时直接报错而不是继续往下跑。
+
 跑完会在 `research/output/etf_sweep/`（可用 `--output-dir` 改）下写一份
 `sweep_summary.csv`（按 `n_deployable`、`mean_oos_z` 排序）和每个"有样本外
 显著 pair 存活"的组合各自的 `pairs_thr<T>_lag<L>.csv`/`.meta.json`。**这一步

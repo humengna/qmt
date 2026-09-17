@@ -47,7 +47,6 @@ import pandas as pd
 
 from intraday import data as idd
 from intraday.event import build_follower_frames, build_leader_frames_threshold
-from leadlag import data as ld
 from leadlag.factor import (
     MiningConfig,
     compute_pairwise_stats_same_row,
@@ -101,8 +100,10 @@ def parse_args():
     p.add_argument("--suspend-csv")
     p.add_argument("--no-download", action="store_true")
     p.add_argument("--top-liquid", type=int, default=None,
-                    help="(xtdata only) shrink SYMBOL_LIST to the N most liquid ETFs by "
-                         "median daily traded value before mining. Also a hedge against "
+                    help="(xtdata only) shrink SYMBOL_LIST to the N most liquid ETFs before "
+                         "mining, ranked by median daily turnover summed from the SAME "
+                         "minute bars this pipeline mines on (no daily bars involved - see "
+                         "intraday.data.rank_by_intraday_turnover_xtdata). Also a hedge against "
                          "the 'hub follower' pattern (see exclude_hub_followers): the "
                          "least liquid names in a fixed cross-border/commodity ETF list "
                          "are the most likely to be thin near-duplicate trackers whose "
@@ -202,14 +203,13 @@ def _load_panels(args):
     if args.source == "xtdata":
         universe = SYMBOL_LIST
         if args.top_liquid:
-            # download=True: ranking needs DAILY bars, which are cached separately from
-            # the 5m bars this pipeline mines on - see rank_stocks_by_liquidity_xtdata.
-            universe = ld.rank_stocks_by_liquidity_xtdata(
-                universe, start_time=args.start, end_time=args.end, top_n=args.top_liquid,
-                download=not args.no_download,
+            universe = idd.rank_by_intraday_turnover_xtdata(
+                universe, start_time=args.start, end_time=args.end, period=args.period,
+                top_n=args.top_liquid, download=not args.no_download,
             )
-            print(f"kept top {len(universe)} of {len(SYMBOL_LIST)} ETFs by median daily traded value")
-        minute_close, minute_suspend, _daily_close = idd.fetch_intraday_panels_xtdata(
+            print(f"kept top {len(universe)} of {len(SYMBOL_LIST)} ETFs by median daily "
+                  f"turnover (reconstructed from {args.period} bars)")
+        minute_close, minute_suspend = idd.fetch_intraday_close_panels_xtdata(
             universe, start_time=args.start, end_time=args.end, period=args.period,
             download=not args.no_download,
         )

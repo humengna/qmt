@@ -72,7 +72,7 @@ def load_panels(args, pairs: pd.DataFrame, meta: dict):
     if args.source == "xtdata":
         # Only fetch what this pair table actually needs, not the whole SYMBOL_LIST.
         stock_list = sorted(set(pairs["leader"]) | set(pairs["follower"]))
-        minute_close, minute_suspend, _daily_close = idd.fetch_intraday_panels_xtdata(
+        minute_close, minute_suspend = idd.fetch_intraday_close_panels_xtdata(
             stock_list, start_time=args.start, end_time=args.end, period=meta.get("period", "5m"),
             download=False,
         )
