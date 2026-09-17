@@ -34,15 +34,22 @@ def parse_args():
     p.add_argument("--top-k", type=int, default=5)
     p.add_argument("--initial-capital", type=float, default=1_000_000.0)
     p.add_argument("--commission-bps", type=float, default=3.0,
-                    help="per side, in bps of trade value (IntradayBacktestConfig default: 3.0)")
+                    help="per side, in bps of trade value. Set this to your broker's actual "
+                         "rate - discount rates around 1bp are common, and at the position "
+                         "sizes here (equity/--top-k) a per-order minimum of a few yuan "
+                         "doesn't bind: 1bp of a 100k position is already 10 yuan.")
     p.add_argument("--slippage-bps", type=float, default=10.0,
-                    help="per side (IntradayBacktestConfig default: 10.0). Lower this to test "
-                         "whether a negative backtest is purely a cost-assumption artifact, "
-                         "e.g. --slippage-bps 0 --commission-bps 0 --stamp-tax-bps 0 isolates "
-                         "the gross (no-cost) result the same way as diffing trades.csv's "
-                         "'pnl' column against raw entry/exit price differences.")
-    p.add_argument("--stamp-tax-bps", type=float, default=5.0,
-                    help="sell side only, A-share stamp duty (IntradayBacktestConfig default: 5.0)")
+                    help="per side. NOT a fee - this is the cost of crossing the spread, and "
+                         "it stays real even with zero commission: fills here are modelled at "
+                         "the bar's CLOSE, while a live market order pays the ask to buy and "
+                         "the bid to sell. Chinese ETFs quote in 0.001 ticks, so a ~1 yuan "
+                         "cross-border ETF has a 1-tick spread worth ~10bp, i.e. ~5bp per side "
+                         "just to cross it. 0 measures the gross edge, not an achievable fill.")
+    p.add_argument("--stamp-tax-bps", type=float, default=0.0,
+                    help="sell side only. Defaults to 0 because ETF trades are EXEMPT from "
+                         "China's 印花税 (it applies to the seller of individual stocks, which "
+                         "is why intraday/backtest.py's own default is 5.0 for the stock "
+                         "pipelines). Leave at 0 for the T0-ETF universe.")
     p.add_argument("--equity-csv", default="research/output/etf_equity_curve.csv")
     p.add_argument("--trades-csv", default="research/output/etf_trades.csv",
                     help="per-trade log; inspect this first when the equity curve is "

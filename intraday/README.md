@@ -105,9 +105,25 @@ ETF 等）——这些品种：
 
 针对这两点分别加了诊断/防护手段：
 
-**成本敏感性**：`run_etf_backtest.py` 新增 `--commission-bps`/`--slippage-bps`
-/`--stamp-tax-bps`，可以覆盖 `IntradayBacktestConfig` 的默认值，用来验证
-"扣掉成本才由正转负"这个判断，而不用改代码：
+**ETF 的成本结构跟股票不一样（务必看清楚）**：
+
+- **印花税：ETF 免征**。印花税只对**个股**的卖出方征收，交易所交易的基金
+  （ETF/LOF）是免税的。`intraday/backtest.py` 里 `stamp_tax_bps=5.0` 的默认值
+  是给股票管道用的；`run_etf_backtest.py` 的 `--stamp-tax-bps` **默认已改为 0**。
+  （这里踩过坑：最早几次 ETF 回测沿用了股票的 5bp 印花税，等于每个往返多收
+  5bp——对一个毛利只有十几bp的信号来说，这个误差不小。）
+- **佣金**：按你券商实际费率填。万分之一（1bp）这种折扣价很常见。每笔最低
+  5 元这类门槛在本回测的仓位规模下**不会触发**：仓位是 `权益/--top-k`，就算
+  权益跌到 50 万、top_k=5，单仓也有 10 万，1bp 就是 10 元，已经高过 5 元下限。
+- **滑点不是手续费，不能因为"没有其他费用"就填 0**。回测的成交价用的是 K 线
+  **收盘价**，而实盘市价单买要吃卖一、卖要砸买一。国内 ETF 报价最小变动是
+  0.001 元，一只 1 块钱左右的跨境 ETF，一个最小变动价位就是约 10bp 的价差，
+  也就是**光穿价差每边就要付约 5bp**。`--slippage-bps 0` 量出来的是**毛边际**，
+  不是一个真能成交的价格。
+
+**成本敏感性**：`run_etf_backtest.py` 的 `--commission-bps`/`--slippage-bps`
+/`--stamp-tax-bps` 可以覆盖 `IntradayBacktestConfig` 的默认值，用来分离
+"信号本身"和"成本假设"这两件事，而不用改代码：
 
 ```bash
 python research/run_etf_backtest.py --pairs research/output/etf_pairs.csv --source xtdata \
