@@ -58,6 +58,13 @@ def parse_args():
                     help="Only report performance from this bar timestamp onward. "
                          "Default 'use-meta' restricts to the mining run's held-out "
                          "test window. Pass 'none' for full history.")
+    p.add_argument("--download", action="store_true",
+                    help="(xtdata only) fetch this period's history for the pair table's "
+                         "symbols before reading it. Off by default because the usual case "
+                         "backtests the same range that was just mined, which is already "
+                         "cached - but a FORWARD test over a later range (--start after the "
+                         "mining window, --eval-start none) reads bars that were never "
+                         "downloaded, and without this it silently sees nothing there.")
     return p.parse_args()
 
 
@@ -79,10 +86,18 @@ def load_panels(args, pairs: pd.DataFrame, meta: dict):
     if args.source == "xtdata":
         # Only fetch what this pair table actually needs, not the whole SYMBOL_LIST.
         stock_list = sorted(set(pairs["leader"]) | set(pairs["follower"]))
+        period = meta.get("period", "5m")
         minute_close, minute_suspend = idd.fetch_intraday_close_panels_xtdata(
-            stock_list, start_time=args.start, end_time=args.end, period=meta.get("period", "5m"),
-            download=False,
+            stock_list, start_time=args.start, end_time=args.end, period=period,
+            download=args.download,
         )
+        if minute_close.empty or minute_close.shape[1] == 0:
+            raise SystemExit(
+                f"no {period} bars for the pair table's {len(stock_list)} symbol(s) over "
+                f"{args.start or '(open)'}..{args.end or '(open)'}. If this is a FORWARD test "
+                f"over a range later than the mining window, that history was never "
+                f"downloaded - re-run with --download."
+            )
         leader_triggered, _ = build_leader_frames_threshold(minute_close, minute_suspend, threshold=leader_threshold)
         return leader_triggered, minute_close
     raise SystemExit(f"unknown source {args.source}")
