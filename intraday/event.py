@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .data import broadcast_prev_close_to_bars, compute_first_touch_indicator, compute_forward_outcome
+from .data import (
+    broadcast_prev_close_to_bars,
+    compute_first_threshold_cross_indicator,
+    compute_first_touch_indicator,
+    compute_forward_outcome,
+)
 
 
 def build_leader_frames(
@@ -22,6 +27,23 @@ def build_leader_frames(
     prev_close_by_bar = broadcast_prev_close_to_bars(minute_close.index, daily_close)
     valid = minute_close.notna() & (minute_suspend != 1) & prev_close_by_bar.notna()
     triggered = compute_first_touch_indicator(minute_close, prev_close_by_bar, valid, tolerance)
+    return triggered, valid
+
+
+def build_leader_frames_threshold(
+    minute_close: pd.DataFrame, minute_suspend: pd.DataFrame, threshold: float = 0.01,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build the (leader_triggered, leader_valid) panels using a plain intraday-rise
+    threshold instead of a price-limit formula: did the stock FIRST reach a cumulative
+    return of `threshold` since ITS OWN DAY'S FIRST BAR, at this specific bar?
+
+    Use this instead of `build_leader_frames` when the leader universe isn't subject to
+    (or doesn't usefully hit) a 涨停/price-limit rule at all - e.g. T0-eligible
+    cross-border/commodity/bond ETFs, which rarely if ever seal at a board limit. Needs
+    only intraday close prices, no daily_close/limit-percentage input.
+    """
+    valid = minute_close.notna() & (minute_suspend != 1)
+    triggered = compute_first_threshold_cross_indicator(minute_close, valid, threshold)
     return triggered, valid
 
 

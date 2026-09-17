@@ -30,22 +30,58 @@
 ```
 intraday/
   data.py      拉分钟线+日线、涨停价广播、首次触板检测(按天去重)、
+                日内涨幅阈值首次触发检测(按天去重，T0 ETF 用)、
                 跨日边界感知的"从 t 到 t+lag_bars 是否上涨"前瞻指标构造、
-                分钟级合成数据生成器
-  event.py     把上面这些拼成 build_leader_frames / build_follower_frames
+                分钟级合成数据生成器（涨停版 + 阈值版）
+  event.py     把上面这些拼成 build_leader_frames（涨停版）/
+                build_leader_frames_threshold（阈值版）/ build_follower_frames
   backtest.py  盘中回测引擎：触发即建仓、持有恰好 lag_bars 根K线、
                 当天最后一根K线强制清仓（不留隔夜仓位）
 research/
-  run_intraday_mining.py    离线挖掘 CLI
-  run_intraday_backtest.py  回测 CLI
+  run_intraday_mining.py    离线挖掘 CLI（涨停触发，全市场/按行业配对）
+  run_intraday_backtest.py  回测 CLI（涨停触发）
+  run_etf_mining.py         离线挖掘 CLI（T0 ETF，日内涨幅阈值触发，不分行业）
+  run_etf_backtest.py       回测 CLI（T0 ETF）
 strategy/
   intraday_strategy.py      QMT ContextInfo 策略脚本，运行在分钟周期上
 tests/
-  test_intraday.py          合成数据测试：涨停价公式精确匹配、每天每票最多
-                            触发一次、前瞻窗口不跨日、挖掘找回注入信号、
-                            纯噪声样本外FDR拒绝、回测端到端跑通+验证退出
-                            调度不跨日
+  test_intraday.py          合成数据测试：涨停价公式精确匹配、阈值触发正确性、
+                            每天每票最多触发一次、前瞻窗口不跨日、挖掘找回
+                            注入信号、纯噪声样本外FDR拒绝、回测端到端跑通+
+                            验证退出调度不跨日（涨停版 + 阈值版都覆盖）
 ```
+
+## T0 ETF 版本：为什么不能直接用涨停触发
+
+`run_intraday_mining.py`/`build_leader_frames` 的触发定义是"当日某根 K 线首次
+**触及涨停价**"——这对个股成立，但这套项目最初面向个股设计时忽略了一个前提：
+**A 股普通股票是 T+1**，当天买入当天不能卖出，"同日盘中触发买入 → 同日盘中
+卖出"这个回测/实盘设计对个股根本不可执行。能在 A 股市场里做真正日内回转交易
+的，只有部分 **T0 可交易品种**（跨境 QDII/港股通 ETF、商品 ETF、部分债券
+ETF 等）——这些品种：
+
+1. 绝大多数不会真的封涨停（10%/20% 的价格限制对它们要么不适用要么极少触发），
+   用涨停公式当触发条件基本挖不到东西；
+2. T0 资格本身**没法在这套代码里用编程方式验证**（`docs/QMT_API_NOTES.md`
+   翻遍了 QMT 官方 PDF 也没找到 T0/T+1 规则的接口说明）——`run_etf_mining.py`
+   里的 `SYMBOL_LIST` 是用户自己确认过的 T0 品种清单，不是本项目推断出来的。
+
+`run_etf_mining.py`/`build_leader_frames_threshold` 把触发条件换成了更朴素的
+"**从当天第一根 K 线到当前 K 线，累计涨幅首次达到 `--leader-threshold`
+（默认 1%）**"（`compute_first_threshold_cross_indicator`），不再依赖涨停价
+公式、不需要日线收盘价做基准；同时**不做行业/板块限定**，直接在用户提供的
+固定 ETF 全集内两两配对挖掘（`sector_map=None`）——这些 ETF 之间没有申万一级
+行业结构，"同板块"这个概念对它们不适用。挖掘/样本外验证/FDR/回测引擎全部
+复用 `leadlag.factor` 的同行对齐版本和 `intraday/backtest.py`，跟涨停版本
+完全一致，唯一区别就是这一个"触发定义"。
+
+**注意合成数据里的噪声尺度**：`make_synthetic_threshold_market` 的背景波动率
+比涨停版 `make_synthetic_intraday_market` 小了一个数量级——涨停版是为了让
+个股级别的波动率能通过复利滚到 10%~20% 的涨停价而调的，同样的波动率下，
+一个"1% 阈值"在 47 根 K 线内几乎必然被随机噪声触发（已用真实合成数据验证过：
+提高波动率后，跟任何 leader 都无关的股票也会大量"触发"）。ETF 本身是分散化
+持仓，日内波动天然比个股小得多，1% 在真实 ETF 上本来就应该是一个有信息量的
+稀有事件，合成数据的噪声尺度是照这个直觉调的，不是随便选的。
 
 ## 数据量级警告（务必先读）
 
@@ -72,16 +108,37 @@ K 线。在把这套东西指向全市场、跑好几年历史之前：
 ## 快速开始
 
 ```bash
-# 合成数据端到端跑通（内置了几组"真实"的盘中触发关系）
+# 涨停触发版：合成数据端到端跑通（内置了几组"真实"的盘中触发关系）
 python research/run_intraday_mining.py --source synthetic --min-obs 15 \
     --candidate-mode top-n --top-n 40 --output research/output/intraday_pairs.csv
 python research/run_intraday_backtest.py --pairs research/output/intraday_pairs.csv --source synthetic
 
-# 单元测试
+# T0 ETF 阈值触发版：合成数据端到端跑通
+python research/run_etf_mining.py --source synthetic --min-obs 15 \
+    --candidate-mode top-n --top-n 40 --output research/output/etf_pairs.csv
+python research/run_etf_backtest.py --pairs research/output/etf_pairs.csv --source synthetic
+
+# 单元测试（两个版本都在这一个文件里）
 python -m unittest tests.test_intraday -v
 ```
 
-## 接入真实数据 / 部署到 QMT
+接入真实数据跑 T0 ETF 版本（`SYMBOL_LIST` 已经内置在 `run_etf_mining.py` 里，
+不需要传股票池参数，也不需要 `--sectors`/`--top-liquid`）：
+
+```bash
+python research/run_etf_mining.py --source xtdata --start 20220101 --end 20240601 \
+    --output research/output/etf_pairs.csv
+python research/run_etf_backtest.py --pairs research/output/etf_pairs.csv --source xtdata \
+    --start 20220101 --end 20240601
+```
+
+**尚未实现**：`strategy/intraday_strategy.py` 里的实盘触发逻辑是照涨停公式
+写死的（`_limit_pct_for_code` + `prev_close`），还不能直接拿去跑 T0 ETF 版本
+挖出来的 pairs——真要上实盘，需要照它的结构另写一份用"日内涨幅阈值"当触发
+条件的 ContextInfo 脚本。目前 `run_etf_mining.py`/`run_etf_backtest.py` 只
+覆盖研究/回测阶段。
+
+## 接入真实数据 / 部署到 QMT（涨停触发版）
 
 ```bash
 python research/run_intraday_mining.py --source xtdata --top-liquid 300 \

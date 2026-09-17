@@ -101,6 +101,34 @@ def compute_first_touch_indicator(
     return first_touch.fillna(False)
 
 
+def compute_first_threshold_cross_indicator(
+    minute_close: pd.DataFrame, valid: pd.DataFrame, threshold: float = 0.01,
+) -> pd.DataFrame:
+    """Boolean panel: is this the FIRST bar, on its trading day, where the stock's
+    cumulative return SINCE THAT DAY'S FIRST VALID BAR first reaches `threshold`?
+
+    Unlike `compute_first_touch_indicator` (which compares against a price-LIMIT level
+    derived from the PRIOR day's close - meaningless for instruments that never seal at
+    a price limit at all, like most T0-eligible cross-border/commodity/bond ETFs), the
+    anchor here is each day's own first traded price, so this works for any instrument
+    with ordinary intraday price data and needs no daily_close/limit-percentage input.
+
+    Same once-per-day dedup trick as `compute_first_touch_indicator`
+    (`groupby(dates).cumsum() == 1`), for the same reason: keeping trigger observations
+    roughly independent for the z-test.
+    """
+    dates = minute_close.index.normalize()
+    day_open = minute_close.where(valid).groupby(dates).transform("first")
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cum_ret = minute_close / day_open - 1
+
+    crossed = (cum_ret >= threshold) & valid & day_open.notna()
+    cum_crossed = crossed.groupby(dates).cumsum()
+    first_cross = crossed & (cum_crossed == 1)
+    return first_cross.fillna(False)
+
+
 def compute_forward_outcome(
     minute_close: pd.DataFrame, valid_raw: pd.DataFrame, lag_bars: int,
     mode: str = "absolute", threshold: float = 0.0,
@@ -253,3 +281,112 @@ def make_synthetic_intraday_market(
     minute_suspend = pd.DataFrame(0, index=index, columns=codes)
     daily_close = minute_close.groupby(minute_close.index.normalize()).last()
     return minute_close, minute_suspend, daily_close, pairs
+
+
+def make_synthetic_threshold_market(
+    n_days: int = 500,
+    bars_per_day: int = 48,
+    n_stocks: int = 40,
+    n_pairs: int = 6,
+    lag_bars: int = 6,
+    threshold: float = 0.01,
+    trigger_prob: float = 0.1,
+    flip_prob: float = 0.6,
+    boost: float = 0.025,
+    seed: int = 0,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[tuple[str, str]]]:
+    """Fabricate an intraday market with injected 'leader's cumulative return since the
+    day's first bar first crosses `threshold` at bar t -> follower up by bar t +
+    lag_bars, same day' relationships - the T0-ETF hypothesis (no price-limit formula
+    involved at all, unlike `make_synthetic_intraday_market`), so this returns just
+    (minute_close, minute_suspend, injected_pairs), no daily_close.
+
+    Trigger bars are forced to start no earlier than bar 1 of the day (bar 0 IS the
+    day's own anchor, so it can never itself have "crossed" anything relative to
+    itself). Each forced trigger overshoots `threshold` by a small fixed buffer before
+    rounding to the instrument's 3-decimal tick size, so the rounded price's actual
+    cumulative return can never fall back under `threshold` - see
+    `compute_first_threshold_cross_indicator`'s `>=` comparison.
+
+    Background per-bar noise is deliberately much smaller than
+    `make_synthetic_intraday_market`'s (which is tuned to plausibly reach a ~10-20%
+    daily price-LIMIT via compounding): ETFs are diversified baskets and materially
+    less volatile intraday than individual stocks, and a 1%-since-open threshold needs
+    a noise scale where crossing it is a genuinely rare, informative event rather than
+    routine cumulative drift - otherwise "leader" and "noise" trigger rates become
+    indistinguishable (verified empirically: the stock-level noise scale made a bare
+    1% threshold trip constantly by pure chance over a 47-bar trading day).
+    """
+    rng = np.random.default_rng(seed)
+    T = n_days * bars_per_day
+    codes = [f"5130{i:02d}.SH" if i % 2 == 0 else f"1597{i:02d}.SZ" for i in range(n_stocks)]
+
+    market = rng.normal(0, 0.00015, T)
+    idio = rng.normal(0, 0.0002, (T, n_stocks))
+    rets = market[:, None] + idio
+
+    shuffled = codes.copy()
+    rng.shuffle(shuffled)
+    pairs = [(shuffled[2 * k], shuffled[2 * k + 1]) for k in range(n_pairs)]
+
+    # trigger_bar[d, i] = the bar-of-day (>= 1) at which stock i is forced to cross
+    # `threshold` (relative to that day's own bar-0 anchor) on day d, or -1.
+    trigger_bar = -np.ones((n_days, n_stocks), dtype=int)
+    max_start = bars_per_day - lag_bars - 1
+
+    for leader, follower in pairs:
+        li, fi = codes.index(leader), codes.index(follower)
+        if max_start <= 1:
+            continue
+        trigger_days = np.where(rng.random(n_days) < trigger_prob)[0]
+        for d in trigger_days:
+            bar_in_day = rng.integers(1, max_start + 1)
+            trigger_bar[d, li] = bar_in_day
+            t = d * bars_per_day + bar_in_day
+
+            if rng.random() < flip_prob:
+                boost_t = t + lag_bars
+                rets[boost_t, fi] += boost
+                day_start, day_end = d * bars_per_day, (d + 1) * bars_per_day
+                non_boosted = np.ones(bars_per_day, dtype=bool)
+                non_boosted[boost_t - day_start] = False
+                day_rows = np.arange(day_start, day_end)[non_boosted]
+                rets[day_rows, fi] -= boost / non_boosted.sum()
+
+    # Day-by-day simulation, same rationale as make_synthetic_intraday_market's: a
+    # trigger bar's forced price must be pinned to an ABSOLUTE level derived from that
+    # day's own actual anchor (bar 0's close), not from a %-return relative to the
+    # immediately preceding bar, which would silently drift off `threshold` whenever
+    # the stock had already moved intraday before the trigger bar.
+    price = np.empty((T, n_stocks))
+    day_basis = np.full(n_stocks, 10.0)
+    buffer = 0.0005  # absorbs the +/-0.0005 rounding noise from the 3-decimal tick size
+    for d in range(n_days):
+        day_start = d * bars_per_day
+        prev_bar = day_basis.copy()
+        triggers_today = trigger_bar[d]
+        day_open = None
+        for b in range(bars_per_day):
+            t = day_start + b
+            bar_price = prev_bar * (1 + rets[t])
+            hit = triggers_today == b
+            if hit.any():
+                bar_price[hit] = day_open[hit] * (1 + threshold + buffer)
+            bar_price = np.round(bar_price, 3)
+            if b == 0:
+                day_open = bar_price.copy()
+            price[t] = bar_price
+            prev_bar = bar_price
+        day_basis = prev_bar
+
+    business_days = pd.bdate_range("2022-01-01", periods=n_days)
+    minute_offsets = pd.timedelta_range("0min", periods=bars_per_day, freq="5min")
+    timestamps = [
+        pd.Timestamp(day) + pd.Timedelta(hours=9, minutes=30) + off
+        for day in business_days for off in minute_offsets
+    ]
+    index = pd.DatetimeIndex(timestamps)
+
+    minute_close = pd.DataFrame(price, index=index, columns=codes)
+    minute_suspend = pd.DataFrame(0, index=index, columns=codes)
+    return minute_close, minute_suspend, pairs
