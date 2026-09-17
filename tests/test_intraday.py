@@ -226,6 +226,56 @@ class TestEtfBacktest(unittest.TestCase):
         self.assertGreater(summary["sharpe"], 0)
 
 
+class TestEtfParamSweep(unittest.TestCase):
+    def test_run_one_combo_recovers_pairs_at_the_matching_lag(self):
+        from types import SimpleNamespace
+
+        from research.run_etf_param_sweep import run_one_combo
+
+        minute_close, minute_suspend, pairs = make_synthetic_threshold_market(
+            n_days=500, bars_per_day=48, n_stocks=40, n_pairs=6, lag_bars=6, threshold=0.01,
+            trigger_prob=0.1, flip_prob=0.6, boost=0.025, seed=3,
+        )
+        args = SimpleNamespace(
+            mode="absolute", threshold=0.0, min_obs=15, candidate_mode="top-n", top_n=40,
+            alpha=0.01, min_lift=0.03, oos_alpha=0.1, min_oos_lift=0.0, train_frac=0.7,
+            max_symbols=500, min_oos_n=5, max_leaders_per_follower=3,
+        )
+        summary, deployable, split = run_one_combo(
+            minute_close, minute_suspend, leader_threshold=0.01, lag_bars=6, args=args
+        )
+        self.assertEqual(summary["leader_threshold"], 0.01)
+        self.assertEqual(summary["lag_bars"], 6)
+        self.assertGreater(summary["n_deployable"], 0)
+        found = set(zip(deployable["leader"], deployable["follower"]))
+        self.assertGreater(len(found & set(pairs)), 0, f"expected to recover some of {set(pairs)}, got {found}")
+
+    def test_max_leaders_per_follower_zero_disables_hub_filter_in_the_pipeline(self):
+        from types import SimpleNamespace
+
+        from research.run_etf_param_sweep import run_one_combo
+
+        minute_close, minute_suspend, pairs = make_synthetic_threshold_market(
+            n_days=500, bars_per_day=48, n_stocks=40, n_pairs=6, lag_bars=6, threshold=0.01,
+            trigger_prob=0.1, flip_prob=0.6, boost=0.025, seed=3,
+        )
+        kwargs = dict(
+            mode="absolute", threshold=0.0, min_obs=15, candidate_mode="top-n", top_n=40,
+            alpha=0.01, min_lift=0.03, oos_alpha=0.1, min_oos_lift=0.0, train_frac=0.7,
+            max_symbols=500, min_oos_n=5,
+        )
+        summary_filtered, _, _ = run_one_combo(
+            minute_close, minute_suspend, leader_threshold=0.01, lag_bars=6,
+            args=SimpleNamespace(max_leaders_per_follower=1, **kwargs),
+        )
+        summary_unfiltered, _, _ = run_one_combo(
+            minute_close, minute_suspend, leader_threshold=0.01, lag_bars=6,
+            args=SimpleNamespace(max_leaders_per_follower=0, **kwargs),
+        )
+        # an aggressive cap (1) can only ever drop pairs relative to no filter at all
+        self.assertLessEqual(summary_filtered["n_deployable"], summary_unfiltered["n_deployable"])
+
+
 class TestIntradayMining(unittest.TestCase):
     def _mine(self, minute_close, minute_suspend, daily_close, lag_bars, cfg, train_frac=0.7, top_n=40):
         leader_triggered, leader_valid = build_leader_frames(minute_close, minute_suspend, daily_close)

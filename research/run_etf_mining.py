@@ -47,6 +47,7 @@ import pandas as pd
 
 from intraday import data as idd
 from intraday.event import build_follower_frames, build_leader_frames_threshold
+from leadlag import data as ld
 from leadlag.factor import (
     MiningConfig,
     compute_pairwise_stats_same_row,
@@ -99,6 +100,16 @@ def parse_args():
     p.add_argument("--close-csv", help="wide CSV of minute close prices (xtdata alternative)")
     p.add_argument("--suspend-csv")
     p.add_argument("--no-download", action="store_true")
+    p.add_argument("--top-liquid", type=int, default=None,
+                    help="(xtdata only) shrink SYMBOL_LIST to the N most liquid ETFs by "
+                         "median daily traded value before mining. Also a hedge against "
+                         "the 'hub follower' pattern (see exclude_hub_followers): the "
+                         "least liquid names in a fixed cross-border/commodity ETF list "
+                         "are the most likely to be thin near-duplicate trackers whose "
+                         "'up' co-movement with everything else is a liquidity/NAV-lag "
+                         "artifact rather than a real relationship, and thin names are "
+                         "also where the backtest's flat slippage assumption is least "
+                         "realistic (likely understating true cost).")
     p.add_argument("--leader-threshold", type=float, default=0.01,
                     help="leader trigger: cumulative return since the day's first bar "
                          "first reaches this (default 0.01 = 1%%). No limit-up formula "
@@ -173,11 +184,17 @@ def load_panels(args):
             else pd.DataFrame(0, index=minute_close.index, columns=minute_close.columns)
         return minute_close, minute_suspend, list(minute_close.columns)
     if args.source == "xtdata":
+        universe = SYMBOL_LIST
+        if args.top_liquid:
+            universe = ld.rank_stocks_by_liquidity_xtdata(
+                universe, start_time=args.start, end_time=args.end, top_n=args.top_liquid
+            )
+            print(f"kept top {len(universe)} of {len(SYMBOL_LIST)} ETFs by median daily traded value")
         minute_close, minute_suspend, _daily_close = idd.fetch_intraday_panels_xtdata(
-            SYMBOL_LIST, start_time=args.start, end_time=args.end, period=args.period,
+            universe, start_time=args.start, end_time=args.end, period=args.period,
             download=not args.no_download,
         )
-        return minute_close, minute_suspend, SYMBOL_LIST
+        return minute_close, minute_suspend, universe
     raise SystemExit(f"unknown source {args.source}")
 
 
