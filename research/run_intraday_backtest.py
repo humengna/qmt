@@ -35,6 +35,12 @@ def parse_args():
     p.add_argument("--top-k", type=int, default=5)
     p.add_argument("--initial-capital", type=float, default=1_000_000.0)
     p.add_argument("--equity-csv", default="research/output/intraday_equity_curve.csv")
+    p.add_argument("--trades-csv", default="research/output/intraday_trades.csv",
+                    help="per-trade log (bar, code, side, shares, price, pnl); the "
+                         "first thing to inspect when the equity curve is negative "
+                         "despite the pairs having passed out-of-sample FDR - it tells "
+                         "you whether a small real edge is being eaten by costs, or "
+                         "specific followers are just losing money outright.")
     p.add_argument("--eval-start", default="use-meta",
                     help="Only report performance from this bar timestamp onward. "
                          "Default 'use-meta' restricts to the mining run's held-out "
@@ -104,7 +110,17 @@ def main():
     out_path = Path(args.equity_csv)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     equity.to_csv(out_path)
-    print(f"wrote equity curve to {out_path} ({len(trades)} trades)")
+
+    trades_path = Path(args.trades_csv)
+    trades_path.parent.mkdir(parents=True, exist_ok=True)
+    trades.to_csv(trades_path, index=False)
+    print(f"wrote equity curve to {out_path} and trade log to {trades_path} ({len(trades)} trades)")
+
+    sells = trades[trades["side"] == "sell"]
+    if not sells.empty:
+        by_code = sells.groupby("code")["pnl"].agg(["sum", "count"]).sort_values("sum")
+        print("\nP&L by follower (worst to best - inspect the biggest losers first):")
+        print(by_code.to_string())
 
 
 if __name__ == "__main__":
