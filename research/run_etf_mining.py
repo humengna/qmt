@@ -1,5 +1,15 @@
 """End-to-end mining pipeline for the T0-ETF intraday spillover hypothesis.
 
+!!! THIS HYPOTHESIS WAS TESTED AND REJECTED - DO NOT TRADE ITS OUTPUT !!!
+Seven rounds against real xtdata (see intraday/README.md's "最终结论" section for
+the numbers) put this signal's GROSS edge at 1.4-3bp per round trip, which is
+smaller than the cheapest commission available in this market: at 1bp per side,
+a forward test on data neither the mining nor the parameter selection had seen
+lost money even with slippage set to ZERO. Break-even needs total round-trip cost
+under ~1.4-1.8bp, i.e. less than commission alone, so no execution improvement
+can rescue it. The pipeline below is kept because the MACHINERY is reusable for
+other hypotheses - the hypothesis it was built for is not.
+
 Hypothesis under test: within a FIXED universe of T0-tradable ETFs (cross-border
 HK/US, commodity, bond - see SYMBOL_LIST below), when one ETF's cumulative return
 since the day's own first bar FIRST crosses `--leader-threshold` (default 1%) at some

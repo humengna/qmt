@@ -1,5 +1,11 @@
 """Backtest a mined T0-ETF threshold-trigger pair table (see run_etf_mining.py).
 
+!!! THE HYPOTHESIS THIS BACKTESTS WAS TESTED AND REJECTED !!! See the warning in
+run_etf_mining.py and intraday/README.md's "最终结论" section. Kept as a working
+backtest harness - notably the --commission-bps/--slippage-bps pair, which is how
+the decisive number was produced: run two cost points and solve for the break-even
+cost, rather than arguing about what slippage "should" be.
+
 Usage::
 
     python research/run_etf_backtest.py --pairs research/output/etf_pairs.csv --source synthetic

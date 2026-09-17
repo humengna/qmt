@@ -4,16 +4,30 @@ reusing them across every combo in the grid - only the trigger detection and min
 stats differ per combo, not the underlying data, so there's no reason to re-download
 or re-parse it per combo.
 
+!!! THE HYPOTHESIS THIS SWEEPS WAS TESTED AND REJECTED !!! This sweep is how that
+was established - see the warning in run_etf_mining.py and intraday/README.md's
+"最终结论" section. Kept as a reusable harness for the NEXT hypothesis.
+
 Why this exists: a single (leader_threshold=0.01, lag_bars=6) run over a longer, more
 recent window found that the earlier "10 out-of-sample-significant pairs" result
 (found on a shorter/older window) doesn't replicate at all (0/389 candidates passed
-the out-of-sample FDR gate - see intraday/README.md's real-data section). Before
-writing this hypothesis off, this sweeps a small grid of leader thresholds and
-holding windows against ONE FIXED, EXPLICIT date range (pass --start/--end yourself -
+the out-of-sample FDR gate). This sweeps a grid of leader thresholds and holding
+windows against ONE FIXED, EXPLICIT date range (pass --start/--end yourself -
 comparing across combos is only meaningful if they all see the same data), with the
 hub-follower filter (`leadlag.factor.exclude_hub_followers`) always applied, to check
 whether some other configuration finds a relationship that's more than a narrow-
 window/parameter-specific artifact.
+
+What it found, across both 5m and 1m granularity: the count of pairs surviving the
+full gauntlet sits at 5-22 no matter how the universe, granularity or parameters
+change, while 74-97% of every OOS-significant set gets dropped as hub-contaminated.
+A residual that doesn't grow with the data is the signature of coincidences clearing
+a multiple-testing bar, not of an effect. `n_hub_excluded_pairs` turned out to be the
+single most informative column here - treat it as a diagnostic, not just a filter.
+
+NOTE the output files are named by threshold and lag only (pairs_thr0.015_lag10.csv)
+- NOT by period or universe size - so two sweeps differing only in those will
+overwrite each other. Give each arm its own --output-dir when comparing.
 
 `--top-liquid` is also worth trying alongside the grid: restricting to the most
 liquid ETFs both reduces the "thin near-duplicate tracker" hub-follower risk and
