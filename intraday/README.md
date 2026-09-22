@@ -11,10 +11,21 @@
 拉上去3%才算，而板块跟风恰恰是被**陡峭度**引发的。回看窗口不跨交易日，所以隔夜
 跳空永远不算急拉，每天每票最多触发一次。
 
-> **⚠️ T+1：个股当天买入不能卖出**，所以本目录回测建模的"同日平仓"对A股个股
-> **不可执行**。挖掘本身仍是有效的研究（而且盘中触发是比任何日线信号都更精确的
-> **入场**时点），但要落地必须改成持有到次日再卖。T+0 品种是另一回事，见
-> `research/run_etf_mining.py`——不过那条假设已因其它原因被否定。
+**两种持有方式**（`--hold`），这决定了**统计验证的是什么**、也决定了能不能落地：
+
+| `--hold` | follower 的"结果"定义 | T+1 |
+|---|---|---|
+| `same-day`（默认） | 之后 `--lag-bars` 根K线内涨了没 | ❌ **个股不可执行** |
+| `overnight` | 从触发K线到**次一交易日** `--exit-at` 那根K线涨了没 | ✅ 可执行 |
+
+> **⚠️ 个股当天买入不能卖出。** 所以对A股个股，`--hold same-day` 的回测只能当
+> 研究看；`--hold overnight` 才是能落地的那个。T+0 品种不受此限，见
+> `research/run_etf_mining.py`（不过那条假设已因其它原因被否定）。
+
+**关键点：`--hold` 同时改变挖掘和回测。** 挖掘验证的就是你选的那个结果指标，
+回测从 `meta.json` 把它读回来用同一种出场方式——**不能拿"30分钟内涨"的统计结论
+去交易一个持有到次日的策略**，那多出来的一整夜收益是统计从没检验过的。这是这个
+项目一直在防的错误，所以两边用同一个开关。
 
 `limitup/`（次日开盘版）的盘中版本："某只龙头股当日某根 K 线首次触及涨停价后，
 同板块内某只跟随股在之后 `lag_bars` 根 K 线内（**同一交易日**）上涨的概率，
@@ -302,6 +313,13 @@ python research/run_intraday_mining.py --source synthetic --trigger surge \
     --leader-threshold 0.02 --surge-window 5 --min-obs 15 \
     --candidate-mode top-n --top-n 40 --output research/output/surge_pairs.csv
 python research/run_intraday_backtest.py --pairs research/output/surge_pairs.csv --source synthetic
+
+# 急拉 + 隔夜持有（个股唯一能落地的组合：盘中触发买入、次日开盘卖出）
+python research/run_intraday_mining.py --source synthetic --trigger surge --hold overnight \
+    --leader-threshold 0.02 --surge-window 5 --min-obs 15 \
+    --candidate-mode top-n --top-n 40 --output research/output/surge_overnight_pairs.csv
+python research/run_intraday_backtest.py --pairs research/output/surge_overnight_pairs.csv \
+    --source synthetic --commission-bps 1 --slippage-bps 5
 
 # T0 ETF 阈值触发版：合成数据端到端跑通
 python research/run_etf_mining.py --source synthetic --min-obs 15 \

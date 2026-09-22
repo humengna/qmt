@@ -6,7 +6,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pandas as pd
 
-from intraday.backtest import IntradayBacktestConfig, build_intraday_scores, simulate_intraday_portfolio
+from intraday.backtest import (
+    IntradayBacktestConfig,
+    _overnight_exit_rows,
+    build_intraday_scores,
+    simulate_intraday_portfolio,
+    simulate_overnight_portfolio,
+)
 from intraday.data import (
     broadcast_prev_close_to_bars,
     limit_pct_for_code,
@@ -16,6 +22,7 @@ from intraday.data import (
 )
 from intraday.event import (
     build_follower_frames,
+    build_follower_frames_overnight,
     build_leader_frames,
     build_leader_frames_surge,
     build_leader_frames_threshold,
@@ -75,6 +82,79 @@ class TestIntradayDetector(unittest.TestCase):
         # the last `lag_bars` bars of every trading day can't have a same-day outcome
         last_bars_of_day = follower_valid.groupby(follower_valid.index.normalize()).tail(lag_bars)
         self.assertFalse(last_bars_of_day.to_numpy().any())
+
+
+class TestOvernightHold(unittest.TestCase):
+    """The T+1-executable variant: trigger intraday, exit the NEXT trading day."""
+
+    def _market(self, **kw):
+        return make_synthetic_surge_market(
+            n_days=400, n_stocks=40, n_pairs=6, lag_bars=6, threshold=0.02, window_bars=5,
+            trigger_prob=0.12, flip_prob=0.6, boost=0.02, seed=3, **kw
+        )
+
+    def test_outcome_measures_next_day_not_same_day(self):
+        minute_close, minute_suspend, _ = self._market()
+        outcome, valid = build_follower_frames_overnight(
+            minute_close, minute_suspend, exit_at="next_open", mode="absolute"
+        )
+        dates = minute_close.index.normalize()
+        day_first = minute_close.groupby(dates).first()
+
+        # pick a bar on the first day and verify against the SECOND day's opening bar
+        code = minute_close.columns[0]
+        t = minute_close.index[5]
+        expected = day_first[code].iloc[1] / minute_close.at[t, code] - 1
+        self.assertEqual(bool(outcome.at[t, code]), expected > 0)
+        self.assertTrue(bool(valid.at[t, code]))
+
+    def test_final_trading_day_has_no_valid_outcome(self):
+        minute_close, minute_suspend, _ = self._market()
+        _, valid = build_follower_frames_overnight(minute_close, minute_suspend, mode="absolute")
+        last_day = minute_close.index.normalize().max()
+        self.assertFalse(valid[minute_close.index.normalize() == last_day].to_numpy().any())
+
+    def test_next_close_exits_later_than_next_open(self):
+        minute_close, minute_suspend, _ = self._market()
+        dates = minute_close.index.normalize().to_numpy()
+        opens = _overnight_exit_rows(minute_close.index, "next_open")
+        closes = _overnight_exit_rows(minute_close.index, "next_close")
+        tradeable = opens >= 0
+        self.assertTrue((closes[tradeable] > opens[tradeable]).all())
+        # and the exit always lands on a LATER day than the entry bar's
+        self.assertTrue((dates[opens[tradeable]] > dates[tradeable]).all())
+
+    def test_every_trade_spans_a_day_boundary(self):
+        # the whole point: a position held across a day boundary satisfies T+1,
+        # which the same-day engine by construction cannot.
+        minute_close, minute_suspend, pairs = self._market()
+        leader_triggered, _ = build_leader_frames_surge(
+            minute_close, minute_suspend, threshold=0.02, window_bars=5
+        )
+        pairs_df = pd.DataFrame(
+            [{"leader": l, "follower": f, "oos_z": 3.0} for l, f in pairs]
+        )
+        score = build_intraday_scores(leader_triggered, pairs_df, weight_col="oos_z")
+        cfg = IntradayBacktestConfig(lag_bars=6, top_k=5, initial_capital=1_000_000.0)
+        equity, trades = simulate_overnight_portfolio(score, minute_close, cfg, exit_at="next_open")
+
+        self.assertGreater(len(trades), 0)
+        self.assertEqual(len(equity), len(score))
+        self.assertTrue((equity > 0).all())
+
+        buys = trades[trades["side"] == "buy"].reset_index(drop=True)
+        sells = trades[trades["side"] == "sell"].reset_index(drop=True)
+        self.assertEqual(len(buys), len(sells))
+        for code, grp in trades.groupby("code"):
+            grp = grp.sort_values("bar")
+            b = grp[grp["side"] == "buy"]["bar"].to_numpy()
+            s = grp[grp["side"] == "sell"]["bar"].to_numpy()
+            n = min(len(b), len(s))
+            for entry, exit_ in zip(b[:n], s[:n]):
+                self.assertGreater(
+                    pd.Timestamp(exit_).normalize(), pd.Timestamp(entry).normalize(),
+                    f"{code} entered {entry} and exited {exit_} on the same day - violates T+1",
+                )
 
 
 class TestSurgeDetector(unittest.TestCase):

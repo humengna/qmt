@@ -46,23 +46,77 @@ def build_intraday_scores(
     return pd.DataFrame(score, index=leader_triggered.index, columns=followers)
 
 
+def _same_day_exit_rows(bar_times: pd.DatetimeIndex, lag_bars: int) -> np.ndarray:
+    """exit_rows[i] = i + lag_bars, or -1 when that would spill past bar i's own trading
+    day. A trigger bar without enough room left is skipped entirely rather than truncated
+    to a shorter hold, so every realized trade matches the exact window
+    `filter_oos_significant` validated instead of a quietly un-validated shorter variant.
+    """
+    n = len(bar_times)
+    last_of_day = pd.Series(np.arange(n), index=bar_times).groupby(bar_times.normalize()).transform("max")
+    exit_rows = np.arange(n) + lag_bars
+    exit_rows[exit_rows >= n] = -1
+    spills = (exit_rows > last_of_day.to_numpy()) & (exit_rows >= 0)
+    exit_rows[spills] = -1
+    return exit_rows
+
+
+def _overnight_exit_rows(bar_times: pd.DatetimeIndex, exit_at: str = "next_open") -> np.ndarray:
+    """exit_rows[i] = the NEXT trading day's first (or last) bar row, or -1 for bars on
+    the panel's final day, which have no next session to exit into.
+
+    Every position therefore spans a day boundary, which is what makes this schedule
+    executable on A-share equities at all (T+1: a stock bought today cannot be sold
+    today). Pair it with `intraday.event.build_follower_frames_overnight` so the mining
+    validated the same hold the backtest trades.
+    """
+    if exit_at not in ("next_open", "next_close"):
+        raise ValueError(f"unknown exit_at: {exit_at!r}, expected 'next_open' or 'next_close'")
+
+    n = len(bar_times)
+    dates = bar_times.normalize()
+    rows = pd.Series(np.arange(n), index=bar_times)
+    per_day = rows.groupby(dates).min() if exit_at == "next_open" else rows.groupby(dates).max()
+    next_day_row = per_day.shift(-1)
+    return next_day_row.reindex(dates).fillna(-1).to_numpy(dtype=np.int64)
+
+
 def simulate_intraday_portfolio(
     score: pd.DataFrame, close_px: pd.DataFrame, cfg: IntradayBacktestConfig,
 ) -> tuple[pd.Series, pd.DataFrame]:
-    """Enter a follower at the bar its score turns positive, exit exactly
-    `cfg.lag_bars` bars later. A trigger bar without `cfg.lag_bars` of room left in
-    its trading day is skipped entirely (not truncated to a shorter hold) - this keeps
-    every realized trade matching the exact window `filter_oos_significant` actually
-    validated, rather than quietly trading an un-validated shorter variant near the
-    close. Position sizing uses equity as of the LAST bar marked to market, never the
-    entry bar's own close (no look-ahead in sizing).
+    """Enter a follower at the bar its score turns positive, exit exactly `cfg.lag_bars`
+    bars later, never holding overnight.
+
+    NOT executable on A-share equities (T+1 forbids the same-day round trip) - use
+    `simulate_overnight_portfolio` for those. This stays for T0-eligible instruments and
+    for measuring the same-day effect as a research question.
+    """
+    return _simulate(score, close_px, cfg, _same_day_exit_rows(score.index, cfg.lag_bars))
+
+
+def simulate_overnight_portfolio(
+    score: pd.DataFrame, close_px: pd.DataFrame, cfg: IntradayBacktestConfig,
+    exit_at: str = "next_open",
+) -> tuple[pd.Series, pd.DataFrame]:
+    """Enter a follower at the bar its score turns positive, exit on the NEXT trading
+    day - the T+1-executable version of `simulate_intraday_portfolio`.
+
+    `cfg.lag_bars` is unused here: the hold is defined by the calendar, not a bar count.
+    """
+    return _simulate(score, close_px, cfg, _overnight_exit_rows(score.index, exit_at))
+
+
+def _simulate(
+    score: pd.DataFrame, close_px: pd.DataFrame, cfg: IntradayBacktestConfig,
+    exit_rows: np.ndarray,
+) -> tuple[pd.Series, pd.DataFrame]:
+    """Shared engine: `exit_rows[i]` is the bar row a position entered at bar i must be
+    closed on, or -1 if bar i cannot be entered at all. Position sizing uses equity as of
+    the LAST bar marked to market, never the entry bar's own close (no look-ahead).
     """
     bar_times = score.index
-    dates = bar_times.normalize()
     one_side_cost = (cfg.commission_bps + cfg.slippage_bps) / 10_000.0
     sell_cost = one_side_cost + cfg.stamp_tax_bps / 10_000.0
-
-    last_bar_idx_of_day = pd.Series(np.arange(len(bar_times)), index=bar_times).groupby(dates).transform("max")
 
     cash = cfg.initial_capital
     prev_equity = cfg.initial_capital
@@ -84,12 +138,10 @@ def simulate_intraday_portfolio(
                 "shares": pos["shares"], "price": px, "pnl": proceeds - entry_cost,
             })
 
-        # 2) enter today's top-K positive-score followers, only if the full
-        #    lag_bars holding window still fits in today's session
-        exit_idx = i + cfg.lag_bars
-        has_room = exit_idx <= last_bar_idx_of_day.iloc[i]
+        # 2) enter this bar's top-K positive-score followers, if it has a usable exit
+        exit_idx = int(exit_rows[i])
         free_slots = cfg.top_k - len(positions)
-        if free_slots > 0 and has_room and bar_time in score.index:
+        if free_slots > 0 and exit_idx > i and bar_time in score.index:
             today_scores = score.loc[bar_time].dropna()
             today_scores = today_scores[today_scores > 0].sort_values(ascending=False)
             if not today_scores.empty:

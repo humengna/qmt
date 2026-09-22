@@ -18,7 +18,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 
 from intraday import data as idd
-from intraday.backtest import IntradayBacktestConfig, build_intraday_scores, simulate_intraday_portfolio
+from intraday.backtest import (
+    IntradayBacktestConfig,
+    build_intraday_scores,
+    simulate_intraday_portfolio,
+    simulate_overnight_portfolio,
+)
 from intraday.event import build_leader_frames, build_leader_frames_surge
 from leadlag.metrics import performance_summary
 
@@ -156,7 +161,16 @@ def main():
         commission_bps=args.commission_bps, slippage_bps=args.slippage_bps,
         stamp_tax_bps=args.stamp_tax_bps,
     )
-    equity, trades = simulate_intraday_portfolio(score, minute_close, cfg)
+    # the hold is whatever the mining VALIDATED - trading a different one would make the
+    # backtest test a hypothesis the statistics never checked
+    if meta.get("hold", "same-day") == "overnight":
+        exit_at = meta.get("exit_at", "next_open")
+        print(f"holding overnight, exiting at the next trading day's {exit_at} (T+1 executable)")
+        equity, trades = simulate_overnight_portfolio(score, minute_close, cfg, exit_at=exit_at)
+    else:
+        print(f"holding {cfg.lag_bars} bars within the session - NOT executable on A-share "
+              f"equities (T+1). Re-mine with --hold overnight for a tradeable variant.")
+        equity, trades = simulate_intraday_portfolio(score, minute_close, cfg)
 
     bars_per_day = minute_close.groupby(minute_close.index.normalize()).size().median()
     summary = performance_summary(equity, periods_per_year=int(252 * bars_per_day))

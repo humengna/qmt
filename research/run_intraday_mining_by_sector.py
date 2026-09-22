@@ -69,6 +69,11 @@ def parse_args():
                          "run - see run_intraday_mining.py's --trigger")
     p.add_argument("--leader-threshold", type=float, default=0.02, help="--trigger surge only")
     p.add_argument("--surge-window", type=int, default=5, help="--trigger surge only")
+    p.add_argument("--hold", choices=["same-day", "overnight"], default="same-day",
+                    help="follower outcome / tradeable hold, passed through - 'overnight' is "
+                         "the T+1-executable one for stocks. See run_intraday_mining.py --hold")
+    p.add_argument("--exit-at", choices=["next_open", "next_close"], default="next_open",
+                    help="--hold overnight only")
     p.add_argument("--max-leaders-per-follower", type=int, default=3,
                     help="hub-follower filter applied WITHIN each sector's run; the merge step "
                          "below re-applies only the global symbol-budget cap, so a follower "
@@ -121,6 +126,8 @@ def run_one_sector(sector: str, args, out_dir: Path, log_dir: Path) -> tuple[str
         "--trigger", args.trigger,
         "--leader-threshold", str(args.leader_threshold),
         "--surge-window", str(args.surge_window),
+        "--hold", args.hold,
+        "--exit-at", args.exit_at,
         "--max-leaders-per-follower", str(args.max_leaders_per_follower),
         "--output", str(output_csv),
     ]

@@ -60,7 +60,12 @@ import numpy as np
 import pandas as pd
 
 from intraday import data as idd
-from intraday.event import build_follower_frames, build_leader_frames, build_leader_frames_surge
+from intraday.event import (
+    build_follower_frames,
+    build_follower_frames_overnight,
+    build_leader_frames,
+    build_leader_frames_surge,
+)
 from leadlag import data as ld
 from leadlag.factor import (
     MiningConfig,
@@ -109,9 +114,22 @@ def parse_args():
     p.add_argument("--include-st", action="store_true")
     p.add_argument("--mode", choices=["absolute", "excess"], default="excess")
     p.add_argument("--threshold", type=float, default=0.0)
+    p.add_argument("--hold", choices=["same-day", "overnight"], default="same-day",
+                    help="what the follower's outcome - and therefore the tradeable hold - "
+                         "is. 'same-day': did it rise over the next --lag-bars bars, within "
+                         "the session (NOT executable on A-share equities, which are T+1). "
+                         "'overnight': did it rise from the trigger bar to the NEXT trading "
+                         "day's --exit-at bar, which is executable. Whichever you pick is "
+                         "what gets statistically validated, and run_intraday_backtest.py "
+                         "reads it back from meta.json so the backtest trades the same hold "
+                         "the mining tested.")
+    p.add_argument("--exit-at", choices=["next_open", "next_close"], default="next_open",
+                    help="--hold overnight only: exit on the next trading day's first bar "
+                         "(captures the overnight reaction alone) or its last bar (adds a "
+                         "whole extra session of unrelated variance)")
     p.add_argument("--lag-bars", type=int, default=6,
-                    help="how many bars ahead the follower's outcome is measured "
-                         "(6 bars x 5m = 30 minutes); must stay within the same trading day")
+                    help="--hold same-day only: how many bars ahead the follower's outcome "
+                         "is measured (6 bars x 5m = 30 minutes); must stay within the day")
     p.add_argument("--min-obs", type=int, default=15,
                     help="intraday first-touch events are rarer still than daily "
                          "limit-up days, so this defaults even lower than limitup's 30")
@@ -262,16 +280,23 @@ def main():
     leader_triggered_full, leader_valid_full = build_leader_frames_for(
         args, minute_close, minute_suspend, daily_close
     )
-    follower_outcome_full, follower_valid_full = build_follower_frames(
-        minute_close, minute_suspend, lag_bars=args.lag_bars, mode=args.mode, threshold=args.threshold
-    )
+    if args.hold == "overnight":
+        follower_outcome_full, follower_valid_full = build_follower_frames_overnight(
+            minute_close, minute_suspend, exit_at=args.exit_at, mode=args.mode, threshold=args.threshold
+        )
+    else:
+        follower_outcome_full, follower_valid_full = build_follower_frames(
+            minute_close, minute_suspend, lag_bars=args.lag_bars, mode=args.mode, threshold=args.threshold
+        )
 
     total_triggers = int(leader_triggered_full.iloc[train_sl].to_numpy().sum())
     event_label = (f"+{args.leader_threshold:.1%}-in-{args.surge_window}-bar surge"
                    if args.trigger == "surge" else "first-touch-limit")
+    hold_label = (f"held to the next day's {args.exit_at}" if args.hold == "overnight"
+                  else f"held {args.lag_bars} bars, same session (T+1: NOT executable on stocks)")
     print(f"mining {leader_triggered_full.shape[1]} symbols x {split} train bars "
           f"({total_triggers} total {event_label} events across the universe) "
-          f"{'(same-sector pairs only)' if sector_map else ''}...")
+          f"{'(same-sector pairs only)' if sector_map else ''}; follower outcome = {hold_label}...")
 
     stats = compute_pairwise_stats_same_row(
         leader_triggered_full.iloc[train_sl], leader_valid_full.iloc[train_sl],
@@ -324,6 +349,8 @@ def main():
         "mode": args.mode,
         "threshold": args.threshold,
         "lag_bars": args.lag_bars,
+        "hold": args.hold,
+        "exit_at": args.exit_at,
         "trigger": args.trigger,
         "leader_threshold": args.leader_threshold,
         "surge_window": args.surge_window,

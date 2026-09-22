@@ -15,6 +15,7 @@ from .data import (
     compute_first_threshold_cross_indicator,
     compute_first_touch_indicator,
     compute_forward_outcome,
+    compute_overnight_outcome,
 )
 
 
@@ -77,3 +78,22 @@ def build_follower_frames(
     """
     valid_raw = minute_close.notna() & (minute_suspend != 1)
     return compute_forward_outcome(minute_close, valid_raw, lag_bars, mode=mode, threshold=threshold)
+
+
+def build_follower_frames_overnight(
+    minute_close: pd.DataFrame, minute_suspend: pd.DataFrame, exit_at: str = "next_open",
+    mode: str = "absolute", threshold: float = 0.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build the (follower_outcome, follower_valid) panels for a T+1-executable hold: did
+    the price rise from bar t to the NEXT TRADING DAY's exit bar? Also indexed by the
+    starting bar t, so it pairs with the same "same_row" mining/validation functions as
+    `build_follower_frames`.
+
+    Use this whenever the backtest holds overnight - mining `build_follower_frames`'
+    same-day outcome and then trading an overnight hold validates one hypothesis and
+    trades another. See `intraday.data.compute_overnight_outcome`.
+    """
+    valid_raw = minute_close.notna() & (minute_suspend != 1)
+    return compute_overnight_outcome(
+        minute_close, valid_raw, exit_at=exit_at, mode=mode, threshold=threshold
+    )

@@ -399,6 +399,60 @@ def make_synthetic_intraday_market(
     return minute_close, minute_suspend, daily_close, pairs
 
 
+def compute_overnight_outcome(
+    minute_close: pd.DataFrame, valid_raw: pd.DataFrame, exit_at: str = "next_open",
+    mode: str = "absolute", threshold: float = 0.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """For every bar t, did the price rise from t to the NEXT TRADING DAY's exit bar?
+    Indexed by the starting bar t, like `compute_forward_outcome` - so this is still a
+    "same_row" quantity and pairs with leadlag.factor's same-row entry points.
+
+    This is the T+1-executable counterpart of `compute_forward_outcome`: A-share equities
+    cannot be sold on the day they were bought, so a same-day round trip is not a thing a
+    stock strategy can do, while "trigger intraday, exit next day" is. Mining on THIS
+    outcome is what keeps the statistics and the backtest testing the same thing - mining
+    the 30-minute outcome and then trading an overnight hold would validate one hypothesis
+    and trade a different one.
+
+    exit_at='next_open'  -> the next trading day's FIRST valid bar (captures the overnight
+                            reaction and nothing else; the conservative default).
+    exit_at='next_close' -> the next trading day's LAST valid bar (adds a full extra
+                            session of unrelated return variance - a different, weaker
+                            hypothesis, but it is what a "sell before close tomorrow"
+                            rule actually earns).
+
+    Bars on the panel's final trading day have no next day and are marked invalid.
+    """
+    if exit_at not in ("next_open", "next_close"):
+        raise ValueError(f"unknown exit_at: {exit_at!r}, expected 'next_open' or 'next_close'")
+
+    idx = minute_close.index
+    dates = idx.normalize()
+    masked = minute_close.where(valid_raw)
+
+    per_day = masked.groupby(dates).first() if exit_at == "next_open" else masked.groupby(dates).last()
+    next_day_px = per_day.shift(-1)
+    exit_px = next_day_px.reindex(dates)
+    exit_px.index = idx
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fwd_ret = exit_px / minute_close - 1
+
+    if mode == "excess":
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            market = np.nanmedian(fwd_ret.to_numpy(dtype=np.float64), axis=1, keepdims=True)
+        signal = fwd_ret - market
+    elif mode == "absolute":
+        signal = fwd_ret
+    else:
+        raise ValueError(f"unknown mode: {mode!r}, expected 'absolute' or 'excess'")
+
+    valid = valid_raw & exit_px.notna() & minute_close.notna()
+    up = (signal > threshold) & valid
+    return up.fillna(False), valid.fillna(False)
+
+
 def make_synthetic_surge_market(
     n_days: int = 400,
     bars_per_day: int = 48,
