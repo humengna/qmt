@@ -222,6 +222,17 @@ def load_panels(args):
     if args.source == "xtdata":
         stock_list = ld.get_full_market_stock_list_xtdata(tuple(args.sectors))
         print(f"universe size: {len(stock_list)}")
+        if not stock_list:
+            raise SystemExit(
+                f"--sectors {' '.join(args.sectors)} matched no stocks. get_stock_list_in_sector "
+                f"returns an EMPTY LIST for a board name this QMT client doesn't have rather "
+                f"than raising, and board naming differs between installations and data vendors "
+                f"(one client's 'SW1电子' may be '电子' or absent in another). Dump the names this "
+                f"client actually has:\n"
+                f"    python -c \"import sys; sys.path.insert(0,'.'); "
+                f"from leadlag.data import list_sectors_xtdata; "
+                f"names, _ = list_sectors_xtdata(); print(len(names)); print([n for n in names if '电子' in n])\""
+            )
         if not args.include_st:
             st_codes = lud.build_st_exclusion_set_xtdata(stock_list)
             stock_list = [c for c in stock_list if c not in st_codes]
