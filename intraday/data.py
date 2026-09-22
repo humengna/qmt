@@ -170,6 +170,53 @@ def compute_first_touch_indicator(
     return first_touch.fillna(False)
 
 
+def compute_first_surge_indicator(
+    minute_close: pd.DataFrame, valid: pd.DataFrame, threshold: float = 0.02, window_bars: int = 5,
+) -> pd.DataFrame:
+    """Boolean panel: is this the FIRST bar, on its trading day, where the stock's return
+    over the TRAILING `window_bars` bars reaches `threshold`? I.e. "急拉" - a sharp move,
+    with both its size and the time it happened in as parameters.
+
+    This is deliberately NOT `compute_first_threshold_cross_indicator`, whose anchor is
+    the day's opening price: a stock that grinds +3% up over four hours clears a 3%
+    since-open threshold but is nothing like a spike, and the whole premise of a
+    sector-sympathy hypothesis is that it's the SHARPNESS that gets other traders'
+    attention. Anchoring on a rolling window instead of the open separates the two.
+
+    The lookback never crosses into the previous trading day (an overnight gap is not a
+    surge, and the prior close isn't a price this stock's holders could have reacted to
+    intraday), so the first `window_bars` bars of every day can't trigger.
+
+    Same once-per-day dedup as the other detectors (`groupby(dates).cumsum() == 1`): a
+    stock that keeps ripping for an hour is one event, not twelve, which keeps trigger
+    observations roughly independent for the z-test.
+    """
+    if window_bars <= 0 or window_bars >= len(minute_close):
+        raise ValueError("window_bars must be a positive number smaller than the number of bars")
+
+    idx = minute_close.index
+    dates = idx.normalize().to_numpy()
+    close = minute_close.to_numpy(dtype=np.float64)
+    valid_arr = valid.to_numpy(dtype=bool)
+    n = len(idx)
+
+    past_close = np.full_like(close, np.nan)
+    past_close[window_bars:] = close[:-window_bars]
+    past_valid = np.zeros_like(valid_arr)
+    past_valid[window_bars:] = valid_arr[:-window_bars]
+    same_day = np.zeros(n, dtype=bool)
+    same_day[window_bars:] = dates[window_bars:] == dates[:-window_bars]
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        trailing_ret = close / past_close - 1
+
+    surged = (trailing_ret >= threshold) & valid_arr & past_valid & same_day[:, None]
+    surged_df = pd.DataFrame(surged, index=idx, columns=minute_close.columns)
+
+    cum_surged = surged_df.groupby(dates).cumsum()
+    return (surged_df & (cum_surged == 1)).fillna(False)
+
+
 def compute_first_threshold_cross_indicator(
     minute_close: pd.DataFrame, valid: pd.DataFrame, threshold: float = 0.01,
 ) -> pd.DataFrame:
@@ -350,6 +397,97 @@ def make_synthetic_intraday_market(
     minute_suspend = pd.DataFrame(0, index=index, columns=codes)
     daily_close = minute_close.groupby(minute_close.index.normalize()).last()
     return minute_close, minute_suspend, daily_close, pairs
+
+
+def make_synthetic_surge_market(
+    n_days: int = 400,
+    bars_per_day: int = 48,
+    n_stocks: int = 40,
+    n_pairs: int = 6,
+    lag_bars: int = 6,
+    threshold: float = 0.02,
+    window_bars: int = 5,
+    trigger_prob: float = 0.12,
+    flip_prob: float = 0.6,
+    boost: float = 0.02,
+    seed: int = 0,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[tuple[str, str]]]:
+    """Fabricate an intraday market with injected '急拉' relationships: a leader rises
+    `threshold` over `window_bars` bars, and its follower is then more likely to be up
+    `lag_bars` bars later, same day.
+
+    Trigger bars are drawn from [window_bars, bars_per_day - lag_bars - 1] so that both
+    the leader's lookback window and the follower's forward window stay inside the day.
+    Each forced trigger overshoots `threshold` slightly before rounding to the 0.01 tick
+    A-share stocks quote in, so the rounded price's actual trailing return can't fall
+    back under the threshold.
+
+    Returns (minute_close, minute_suspend, injected_pairs) - no daily_close, since a
+    surge trigger never needs one.
+    """
+    rng = np.random.default_rng(seed)
+    T = n_days * bars_per_day
+    codes = [f"300{i:03d}.SZ" if i % 5 == 0 else f"600{i:03d}.SH" for i in range(n_stocks)]
+
+    market = rng.normal(0, 0.0005, T)
+    idio = rng.normal(0, 0.0008, (T, n_stocks))
+    rets = market[:, None] + idio
+
+    shuffled = codes.copy()
+    rng.shuffle(shuffled)
+    pairs = [(shuffled[2 * k], shuffled[2 * k + 1]) for k in range(n_pairs)]
+
+    trigger_bar = -np.ones((n_days, n_stocks), dtype=int)
+    first_start, last_start = window_bars, bars_per_day - lag_bars - 1
+
+    for leader, follower in pairs:
+        li, fi = codes.index(leader), codes.index(follower)
+        if last_start < first_start:
+            continue
+        for d in np.where(rng.random(n_days) < trigger_prob)[0]:
+            bar_in_day = int(rng.integers(first_start, last_start + 1))
+            trigger_bar[d, li] = bar_in_day
+            t = d * bars_per_day + bar_in_day
+
+            if rng.random() < flip_prob:
+                boost_t = t + lag_bars
+                rets[boost_t, fi] += boost
+                # de-mean within the day so the injection doesn't leak a drift across days
+                day_start, day_end = d * bars_per_day, (d + 1) * bars_per_day
+                non_boosted = np.ones(bars_per_day, dtype=bool)
+                non_boosted[boost_t - day_start] = False
+                rets[np.arange(day_start, day_end)[non_boosted], fi] -= boost / non_boosted.sum()
+
+    price = np.empty((T, n_stocks))
+    day_basis = np.full(n_stocks, 20.0)
+    buffer = 0.001  # absorbs rounding to the 0.01 tick at a ~20 yuan price level
+    for d in range(n_days):
+        day_start = d * bars_per_day
+        prev_bar = day_basis.copy()
+        triggers_today = trigger_bar[d]
+        for b in range(bars_per_day):
+            t = day_start + b
+            bar_price = prev_bar * (1 + rets[t])
+            hit = triggers_today == b
+            if hit.any():
+                # pin to the price `window_bars` bars back (same day by construction),
+                # NOT to a %-return off the previous bar - see the surge detector
+                bar_price[hit] = price[t - window_bars][hit] * (1 + threshold + buffer)
+            bar_price = np.round(bar_price, 2)
+            price[t] = bar_price
+            prev_bar = bar_price
+        day_basis = prev_bar
+
+    business_days = pd.bdate_range("2022-01-01", periods=n_days)
+    minute_offsets = pd.timedelta_range("0min", periods=bars_per_day, freq="5min")
+    index = pd.DatetimeIndex([
+        pd.Timestamp(day) + pd.Timedelta(hours=9, minutes=30) + off
+        for day in business_days for off in minute_offsets
+    ])
+
+    minute_close = pd.DataFrame(price, index=index, columns=codes)
+    minute_suspend = pd.DataFrame(0, index=index, columns=codes)
+    return minute_close, minute_suspend, pairs
 
 
 def make_synthetic_threshold_market(

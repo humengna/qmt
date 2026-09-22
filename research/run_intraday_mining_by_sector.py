@@ -63,7 +63,18 @@ def parse_args():
     p.add_argument("--oos-alpha", type=float, default=0.1)
     p.add_argument("--train-frac", type=float, default=0.7)
     p.add_argument("--min-oos-n", type=int, default=10)
-    p.add_argument("--tolerance", type=float, default=0.003)
+    p.add_argument("--tolerance", type=float, default=0.003, help="--trigger limitup only")
+    p.add_argument("--trigger", choices=["limitup", "surge"], default="limitup",
+                    help="leader event definition, passed through to the per-sector mining "
+                         "run - see run_intraday_mining.py's --trigger")
+    p.add_argument("--leader-threshold", type=float, default=0.02, help="--trigger surge only")
+    p.add_argument("--surge-window", type=int, default=5, help="--trigger surge only")
+    p.add_argument("--max-leaders-per-follower", type=int, default=3,
+                    help="hub-follower filter applied WITHIN each sector's run; the merge step "
+                         "below re-applies only the global symbol-budget cap, so a follower "
+                         "that looks fine inside its own sector is not re-checked across "
+                         "sectors (with --same-sector-only there are no cross-sector pairs "
+                         "anyway, so per-sector is the whole family)")
     p.add_argument("--max-symbols", type=int, default=500,
                     help="GLOBAL live-subscribe budget applied once at merge time")
     p.add_argument("--no-download", action="store_true")
@@ -107,6 +118,10 @@ def run_one_sector(sector: str, args, out_dir: Path, log_dir: Path) -> tuple[str
         "--train-frac", str(args.train_frac),
         "--min-oos-n", str(args.min_oos_n),
         "--tolerance", str(args.tolerance),
+        "--trigger", args.trigger,
+        "--leader-threshold", str(args.leader_threshold),
+        "--surge-window", str(args.surge_window),
+        "--max-leaders-per-follower", str(args.max_leaders_per_follower),
         "--output", str(output_csv),
     ]
     if args.no_download:

@@ -11,6 +11,7 @@ import pandas as pd
 
 from .data import (
     broadcast_prev_close_to_bars,
+    compute_first_surge_indicator,
     compute_first_threshold_cross_indicator,
     compute_first_touch_indicator,
     compute_forward_outcome,
@@ -27,6 +28,23 @@ def build_leader_frames(
     prev_close_by_bar = broadcast_prev_close_to_bars(minute_close.index, daily_close)
     valid = minute_close.notna() & (minute_suspend != 1) & prev_close_by_bar.notna()
     triggered = compute_first_touch_indicator(minute_close, prev_close_by_bar, valid, tolerance)
+    return triggered, valid
+
+
+def build_leader_frames_surge(
+    minute_close: pd.DataFrame, minute_suspend: pd.DataFrame,
+    threshold: float = 0.02, window_bars: int = 5,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build the (leader_triggered, leader_valid) panels for a "急拉" trigger: did the
+    stock FIRST rise `threshold` over the trailing `window_bars` bars at this bar?
+
+    Both the size and the speed of the move are parameters, which is what separates this
+    from `build_leader_frames` (size fixed by the board's price-limit rule) and from
+    `build_leader_frames_threshold` (anchored on the day's open, so a slow grind up
+    counts as much as a spike). Needs only intraday close prices - no daily_close.
+    """
+    valid = minute_close.notna() & (minute_suspend != 1)
+    triggered = compute_first_surge_indicator(minute_close, valid, threshold, window_bars)
     return triggered, valid
 
 

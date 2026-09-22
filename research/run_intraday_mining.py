@@ -1,9 +1,26 @@
 """End-to-end mining pipeline for the SAME-DAY intraday spillover hypothesis.
 
-Hypothesis under test: when a stock FIRST touches its daily price-limit (涨停) at
-some specific intraday bar, other stocks in the SAME sector are more likely to rise
-over the following `--lag-bars` bars, WITHIN THE SAME TRADING DAY, than their own
-baseline propensity (same-day thematic spillover after a board is sealed). This
+Hypothesis under test: when a stock has a leader EVENT at some specific intraday bar,
+other stocks in the SAME sector are more likely to rise over the following
+`--lag-bars` bars, WITHIN THE SAME TRADING DAY, than their own baseline propensity.
+`--trigger` picks what the event is:
+
+  limitup (default) - the stock first touches its daily price limit (涨停). The size
+      of the move is fixed by the board's rule, so it isn't a parameter.
+  surge (急拉)       - the stock first rises `--leader-threshold` over the trailing
+      `--surge-window` bars, i.e. both the SIZE and the SPEED of the move are
+      parameters. A stock that grinds +3% up over four hours clears a since-open
+      threshold but is not a surge, and does not trigger this one.
+
+!!! T+1 WARNING: A-share equities cannot be sold on the day they were bought, so the
+same-day round trip this pipeline's backtest models is NOT executable on stocks. The
+mining is still a valid research question, and the intraday trigger is a
+better-timed ENTRY than any daily signal, but a tradeable version has to hold to the
+next day rather than exiting within the session. (T0-eligible instruments are a
+different matter - see research/run_etf_mining.py, whose own hypothesis was tested
+and rejected for unrelated reasons.)
+
+This
 reuses leadlag's statistical machinery via the "same-row-aligned" entry points in
 leadlag.factor (compute_pairwise_stats_same_row, validate_out_of_sample_same_row):
 the follower's outcome here is already a forward-looking quantity computed AT the
@@ -43,11 +60,12 @@ import numpy as np
 import pandas as pd
 
 from intraday import data as idd
-from intraday.event import build_follower_frames, build_leader_frames
+from intraday.event import build_follower_frames, build_leader_frames, build_leader_frames_surge
 from leadlag import data as ld
 from leadlag.factor import (
     MiningConfig,
     compute_pairwise_stats_same_row,
+    exclude_hub_followers,
     filter_oos_significant,
     filter_significant_pairs,
     select_for_deployment,
@@ -72,7 +90,22 @@ def parse_args():
                          "highest median daily traded value before mining (ranked off "
                          "daily data - cheap even before any minute-bar download).")
     p.add_argument("--no-download", action="store_true")
-    p.add_argument("--tolerance", type=float, default=0.003)
+    p.add_argument("--trigger", choices=["limitup", "surge"], default="limitup",
+                    help="what counts as a leader event. 'limitup': first bar the stock "
+                         "touches its daily price limit (size fixed by the board's rule). "
+                         "'surge' (急拉): first bar its return over the trailing "
+                         "--surge-window bars reaches --leader-threshold, i.e. both the "
+                         "SIZE and the SPEED of the move are parameters. A stock that "
+                         "grinds +3%% up over four hours is not a surge and does not "
+                         "trigger - see intraday.data.compute_first_surge_indicator.")
+    p.add_argument("--leader-threshold", type=float, default=0.02,
+                    help="--trigger surge only: the rise that counts as a surge (default 2%%)")
+    p.add_argument("--surge-window", type=int, default=5,
+                    help="--trigger surge only: how many bars that rise must happen within "
+                         "(default 5 bars; at --period 5m that is 25 minutes). The lookback "
+                         "never crosses into the previous trading day, so an overnight gap "
+                         "never counts as a surge.")
+    p.add_argument("--tolerance", type=float, default=0.003, help="--trigger limitup only")
     p.add_argument("--include-st", action="store_true")
     p.add_argument("--mode", choices=["absolute", "excess"], default="excess")
     p.add_argument("--threshold", type=float, default=0.0)
@@ -91,6 +124,14 @@ def parse_args():
     p.add_argument("--train-frac", type=float, default=0.7)
     p.add_argument("--max-symbols", type=int, default=500)
     p.add_argument("--min-oos-n", type=int, default=10)
+    p.add_argument("--max-leaders-per-follower", type=int, default=3,
+                    help="drop any follower paired with more than this many distinct leaders "
+                         "among the OOS-significant pairs, before the symbol-budget cap "
+                         "(0 disables). A follower 'significant' against many unrelated "
+                         "leaders at once is more likely high-beta to a shared factor than "
+                         "genuinely driven by each of them - see "
+                         "leadlag.factor.exclude_hub_followers. The share it drops is itself "
+                         "a diagnostic: in the T0-ETF study it reached 97%%.")
     p.add_argument("--output", default="research/output/intraday_pairs.csv")
     p.add_argument("--no-diagnostics", action="store_true")
     p.add_argument("--all-sectors", action="store_true")
@@ -121,19 +162,42 @@ def print_diagnostics(stats: pd.DataFrame, cfg: MiningConfig) -> None:
     print("--- end diagnostics ---\n")
 
 
+def build_leader_frames_for(args, minute_close, minute_suspend, daily_close):
+    """Dispatch to the leader-trigger definition --trigger selects."""
+    if args.trigger == "surge":
+        return build_leader_frames_surge(
+            minute_close, minute_suspend, threshold=args.leader_threshold, window_bars=args.surge_window
+        )
+    return build_leader_frames(minute_close, minute_suspend, daily_close, tolerance=args.tolerance)
+
+
 def load_panels(args):
-    """Returns (minute_close, minute_suspend, daily_close, stock_list)."""
+    """Returns (minute_close, minute_suspend, daily_close, stock_list). `daily_close` is
+    None for --trigger surge, which needs no daily bars at all (only the limit-up trigger
+    does, to derive each day's limit price) - and xtdata caches daily and minute bars
+    separately, so not fetching what isn't needed also avoids depending on a daily cache
+    that may not be populated.
+    """
     if args.source == "synthetic":
+        if args.trigger == "surge":
+            minute_close, minute_suspend, injected = idd.make_synthetic_surge_market(
+                lag_bars=args.lag_bars, threshold=args.leader_threshold, window_bars=args.surge_window
+            )
+            print(f"[synthetic] injected {len(injected)} true same-day surge pairs: {injected}")
+            return minute_close, minute_suspend, None, list(minute_close.columns)
         minute_close, minute_suspend, daily_close, injected = idd.make_synthetic_intraday_market(
             lag_bars=args.lag_bars
         )
         print(f"[synthetic] injected {len(injected)} true same-day trigger pairs: {injected}")
         return minute_close, minute_suspend, daily_close, list(minute_close.columns)
     if args.source == "csv":
-        if not (args.close_csv and args.daily_close_csv):
-            raise SystemExit("--close-csv and --daily-close-csv are required for --source csv")
+        if not args.close_csv:
+            raise SystemExit("--close-csv is required for --source csv")
+        if args.trigger == "limitup" and not args.daily_close_csv:
+            raise SystemExit("--daily-close-csv is required for --source csv with --trigger limitup")
         minute_close = pd.read_csv(args.close_csv, index_col=0, parse_dates=True).sort_index()
-        daily_close = pd.read_csv(args.daily_close_csv, index_col=0, parse_dates=True).sort_index()
+        daily_close = pd.read_csv(args.daily_close_csv, index_col=0, parse_dates=True).sort_index() \
+            if args.daily_close_csv else None
         minute_suspend = pd.read_csv(args.suspend_csv, index_col=0, parse_dates=True) if args.suspend_csv \
             else pd.DataFrame(0, index=minute_close.index, columns=minute_close.columns)
         return minute_close, minute_suspend, daily_close, list(minute_close.columns)
@@ -149,10 +213,24 @@ def load_panels(args):
                 stock_list, start_time=args.start, end_time=args.end, top_n=args.top_liquid
             )
             print(f"kept top {len(stock_list)} by median daily traded value")
-        minute_close, minute_suspend, daily_close = idd.fetch_intraday_panels_xtdata(
-            stock_list, start_time=args.start, end_time=args.end, period=args.period,
-            download=not args.no_download,
-        )
+        if args.trigger == "surge":
+            minute_close, minute_suspend = idd.fetch_intraday_close_panels_xtdata(
+                stock_list, start_time=args.start, end_time=args.end, period=args.period,
+                download=not args.no_download,
+            )
+            daily_close = None
+        else:
+            minute_close, minute_suspend, daily_close = idd.fetch_intraday_panels_xtdata(
+                stock_list, start_time=args.start, end_time=args.end, period=args.period,
+                download=not args.no_download,
+            )
+        if minute_close.empty or minute_close.shape[1] == 0:
+            raise SystemExit(
+                f"no {args.period} bars returned for {len(stock_list)} symbol(s) over "
+                f"{args.start or '(open)'}..{args.end or '(open)'}. Check the date range covers "
+                f"real trading days and that this period's history is downloaded locally "
+                f"(drop --no-download, or use QMT's 数据管理)."
+            )
         return minute_close, minute_suspend, daily_close, stock_list
     raise SystemExit(f"unknown source {args.source}")
 
@@ -181,16 +259,18 @@ def main():
 
     cfg = MiningConfig(lag=args.lag_bars, min_obs=args.min_obs, alpha=args.alpha, min_lift=args.min_lift)
 
-    leader_triggered_full, leader_valid_full = build_leader_frames(
-        minute_close, minute_suspend, daily_close, tolerance=args.tolerance
+    leader_triggered_full, leader_valid_full = build_leader_frames_for(
+        args, minute_close, minute_suspend, daily_close
     )
     follower_outcome_full, follower_valid_full = build_follower_frames(
         minute_close, minute_suspend, lag_bars=args.lag_bars, mode=args.mode, threshold=args.threshold
     )
 
     total_triggers = int(leader_triggered_full.iloc[train_sl].to_numpy().sum())
+    event_label = (f"+{args.leader_threshold:.1%}-in-{args.surge_window}-bar surge"
+                   if args.trigger == "surge" else "first-touch-limit")
     print(f"mining {leader_triggered_full.shape[1]} symbols x {split} train bars "
-          f"({total_triggers} total first-touch events across the universe) "
+          f"({total_triggers} total {event_label} events across the universe) "
           f"{'(same-sector pairs only)' if sector_map else ''}...")
 
     stats = compute_pairwise_stats_same_row(
@@ -220,8 +300,16 @@ def main():
     print(f"{len(oos_significant)} pairs are FDR-significant OUT-OF-SAMPLE "
           f"(alpha={args.oos_alpha}) -- this is the real gate")
 
+    deduped = exclude_hub_followers(oos_significant, args.max_leaders_per_follower)
+    n_hub_followers = len(set(oos_significant["follower"]) - set(deduped["follower"])) if len(oos_significant) else 0
+    if n_hub_followers:
+        print(f"excluded {n_hub_followers} 'hub' follower(s) paired with more than "
+              f"--max-leaders-per-follower={args.max_leaders_per_follower} distinct leaders "
+              f"({len(oos_significant) - len(deduped)} pairs dropped) - likely shared-factor/"
+              f"beta exposure, not a real per-leader relationship")
+
     deployable = select_for_deployment(
-        oos_significant, max_unique_symbols=args.max_symbols, min_oos_n=args.min_oos_n
+        deduped, max_unique_symbols=args.max_symbols, min_oos_n=args.min_oos_n
     )
     n_symbols = len(set(deployable["leader"]) | set(deployable["follower"])) if len(deployable) else 0
     print(f"{len(deployable)} pairs kept for deployment ({n_symbols} unique symbols, "
@@ -236,6 +324,9 @@ def main():
         "mode": args.mode,
         "threshold": args.threshold,
         "lag_bars": args.lag_bars,
+        "trigger": args.trigger,
+        "leader_threshold": args.leader_threshold,
+        "surge_window": args.surge_window,
         "tolerance": args.tolerance,
         "period": args.period,
         "test_start": str(minute_close.index[split]) if split < len(minute_close) else None,

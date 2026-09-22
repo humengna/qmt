@@ -19,7 +19,7 @@ import pandas as pd
 
 from intraday import data as idd
 from intraday.backtest import IntradayBacktestConfig, build_intraday_scores, simulate_intraday_portfolio
-from intraday.event import build_leader_frames
+from intraday.event import build_leader_frames, build_leader_frames_surge
 from leadlag.metrics import performance_summary
 
 
@@ -45,31 +45,84 @@ def parse_args():
                     help="Only report performance from this bar timestamp onward. "
                          "Default 'use-meta' restricts to the mining run's held-out "
                          "test window. Pass 'none' for full history.")
+    p.add_argument("--commission-bps", type=float, default=3.0,
+                    help="per side, in bps of trade value. Set this to your broker's actual "
+                         "rate - discount rates around 1bp are common.")
+    p.add_argument("--slippage-bps", type=float, default=10.0,
+                    help="per side. NOT a fee - this is the cost of crossing the spread, and "
+                         "it stays real even with zero commission: fills here are modelled at "
+                         "the bar's CLOSE, while a live market order pays the ask to buy and "
+                         "the bid to sell. Running two cost points and solving for the "
+                         "break-even cost beats arguing about what this number should be.")
+    p.add_argument("--stamp-tax-bps", type=float, default=5.0,
+                    help="sell side only. 5.0 is correct for STOCKS - unlike ETFs, which are "
+                         "exempt from 印花税 (see research/run_etf_backtest.py).")
+    p.add_argument("--download", action="store_true",
+                    help="(xtdata only) fetch this period's history for the pair table's "
+                         "symbols first. Needed for a FORWARD test whose --start is past the "
+                         "mining window, since those bars were never downloaded.")
     return p.parse_args()
 
 
-def load_panels(args, pairs: pd.DataFrame, period: str):
+def _leader_triggered(meta: dict, minute_close, minute_suspend, daily_close):
+    """Rebuild the SAME leader trigger the mining run used, per its meta.json."""
+    if meta.get("trigger", "limitup") == "surge":
+        triggered, _ = build_leader_frames_surge(
+            minute_close, minute_suspend,
+            threshold=meta.get("leader_threshold", 0.02), window_bars=meta.get("surge_window", 5),
+        )
+    else:
+        triggered, _ = build_leader_frames(
+            minute_close, minute_suspend, daily_close, tolerance=meta.get("tolerance", 0.003)
+        )
+    return triggered
+
+
+def load_panels(args, pairs: pd.DataFrame, meta: dict):
     """Returns (leader_triggered, minute_close)."""
+    period = meta.get("period", "5m")
+    surge = meta.get("trigger", "limitup") == "surge"
     if args.source == "synthetic":
-        minute_close, minute_suspend, daily_close, _ = idd.make_synthetic_intraday_market()
-        leader_triggered, _ = build_leader_frames(minute_close, minute_suspend, daily_close)
-        return leader_triggered, minute_close
+        if surge:
+            minute_close, minute_suspend, _ = idd.make_synthetic_surge_market(
+                threshold=meta.get("leader_threshold", 0.02), window_bars=meta.get("surge_window", 5),
+            )
+            daily_close = None
+        else:
+            minute_close, minute_suspend, daily_close, _ = idd.make_synthetic_intraday_market()
+        return _leader_triggered(meta, minute_close, minute_suspend, daily_close), minute_close
     if args.source == "csv":
-        if not (args.close_csv and args.daily_close_csv):
-            raise SystemExit("--close-csv and --daily-close-csv are required for --source csv")
+        if not args.close_csv:
+            raise SystemExit("--close-csv is required for --source csv")
+        if not surge and not args.daily_close_csv:
+            raise SystemExit("--daily-close-csv is required for --source csv with a limitup-trigger pair table")
         minute_close = pd.read_csv(args.close_csv, index_col=0, parse_dates=True).sort_index()
-        daily_close = pd.read_csv(args.daily_close_csv, index_col=0, parse_dates=True).sort_index()
+        daily_close = pd.read_csv(args.daily_close_csv, index_col=0, parse_dates=True).sort_index() \
+            if args.daily_close_csv else None
         minute_suspend = pd.read_csv(args.suspend_csv, index_col=0, parse_dates=True) if args.suspend_csv \
             else pd.DataFrame(0, index=minute_close.index, columns=minute_close.columns)
-        leader_triggered, _ = build_leader_frames(minute_close, minute_suspend, daily_close)
-        return leader_triggered, minute_close
+        return _leader_triggered(meta, minute_close, minute_suspend, daily_close), minute_close
     if args.source == "xtdata":
         stock_list = sorted(set(pairs["leader"]) | set(pairs["follower"]))
-        minute_close, minute_suspend, daily_close = idd.fetch_intraday_panels_xtdata(
-            stock_list, start_time=args.start, end_time=args.end, period=period, download=False,
-        )
-        leader_triggered, _ = build_leader_frames(minute_close, minute_suspend, daily_close)
-        return leader_triggered, minute_close
+        if surge:
+            minute_close, minute_suspend = idd.fetch_intraday_close_panels_xtdata(
+                stock_list, start_time=args.start, end_time=args.end, period=period,
+                download=args.download,
+            )
+            daily_close = None
+        else:
+            minute_close, minute_suspend, daily_close = idd.fetch_intraday_panels_xtdata(
+                stock_list, start_time=args.start, end_time=args.end, period=period,
+                download=args.download,
+            )
+        if minute_close.empty or minute_close.shape[1] == 0:
+            raise SystemExit(
+                f"no {period} bars for the pair table's {len(stock_list)} symbol(s) over "
+                f"{args.start or '(open)'}..{args.end or '(open)'}. If this is a FORWARD test over "
+                f"a range later than the mining window, that history was never downloaded - "
+                f"re-run with --download."
+            )
+        return _leader_triggered(meta, minute_close, minute_suspend, daily_close), minute_close
     raise SystemExit(f"unknown source {args.source}")
 
 
@@ -84,7 +137,7 @@ def main():
         "lag_bars": 6, "period": "5m", "test_start": None,
     }
 
-    leader_triggered, minute_close = load_panels(args, pairs, meta.get("period", "5m"))
+    leader_triggered, minute_close = load_panels(args, pairs, meta)
 
     weight_col = "oos_z" if "oos_z" in pairs.columns else "z"
     score = build_intraday_scores(leader_triggered, pairs, weight_col=weight_col)
@@ -100,6 +153,8 @@ def main():
 
     cfg = IntradayBacktestConfig(
         lag_bars=meta["lag_bars"], top_k=args.top_k, initial_capital=args.initial_capital,
+        commission_bps=args.commission_bps, slippage_bps=args.slippage_bps,
+        stamp_tax_bps=args.stamp_tax_bps,
     )
     equity, trades = simulate_intraday_portfolio(score, minute_close, cfg)
 

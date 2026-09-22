@@ -11,9 +11,15 @@ from intraday.data import (
     broadcast_prev_close_to_bars,
     limit_pct_for_code,
     make_synthetic_intraday_market,
+    make_synthetic_surge_market,
     make_synthetic_threshold_market,
 )
-from intraday.event import build_follower_frames, build_leader_frames, build_leader_frames_threshold
+from intraday.event import (
+    build_follower_frames,
+    build_leader_frames,
+    build_leader_frames_surge,
+    build_leader_frames_threshold,
+)
 from leadlag.factor import (
     MiningConfig,
     compute_pairwise_stats_same_row,
@@ -69,6 +75,116 @@ class TestIntradayDetector(unittest.TestCase):
         # the last `lag_bars` bars of every trading day can't have a same-day outcome
         last_bars_of_day = follower_valid.groupby(follower_valid.index.normalize()).tail(lag_bars)
         self.assertFalse(last_bars_of_day.to_numpy().any())
+
+
+class TestSurgeDetector(unittest.TestCase):
+    """Covers the '急拉' leader trigger: a move of a given SIZE within a given TIME."""
+
+    def _panel(self, closes_by_code, bars_per_day=None):
+        """Build a one-or-two-day minute panel by hand from explicit price paths."""
+        n = len(next(iter(closes_by_code.values())))
+        bars_per_day = bars_per_day or n
+        index = pd.DatetimeIndex([
+            pd.Timestamp("2024-01-01") + pd.Timedelta(days=i // bars_per_day)
+            + pd.Timedelta(hours=9, minutes=30) + pd.Timedelta(minutes=5 * (i % bars_per_day))
+            for i in range(n)
+        ])
+        close = pd.DataFrame(closes_by_code, index=index)
+        return close, pd.DataFrame(0, index=index, columns=close.columns)
+
+    def test_slow_grind_does_not_trigger_but_a_spike_does(self):
+        # THE distinction from compute_first_threshold_cross_indicator: both paths end
+        # up +4% on the day, but only one of them is a surge.
+        n = 24
+        grind = [20.0 * (1 + 0.04 * i / (n - 1)) for i in range(n)]   # +4% spread over 24 bars
+        spike = [20.0] * 10 + [20.8] * 14                             # +4% in a single bar
+        close, suspend = self._panel({"GRIND.SH": grind, "SPIKE.SH": spike})
+
+        triggered, _ = build_leader_frames_surge(close, suspend, threshold=0.02, window_bars=5)
+        self.assertEqual(int(triggered["GRIND.SH"].sum()), 0)
+        self.assertEqual(int(triggered["SPIKE.SH"].sum()), 1)
+
+    def test_lookback_never_crosses_into_the_previous_day(self):
+        # Day 1 ends at 20.0, day 2 opens at 21.0 (+5% overnight gap) and then goes flat.
+        # An overnight gap is not a surge, so nothing may trigger.
+        close, suspend = self._panel({"GAP.SH": [20.0] * 10 + [21.0] * 10}, bars_per_day=10)
+        triggered, _ = build_leader_frames_surge(close, suspend, threshold=0.02, window_bars=5)
+        self.assertEqual(int(triggered["GAP.SH"].sum()), 0)
+
+    def test_matches_the_injected_surge_bars_exactly(self):
+        minute_close, minute_suspend, pairs = make_synthetic_surge_market(
+            n_days=200, n_stocks=30, n_pairs=5, threshold=0.02, window_bars=5, seed=1
+        )
+        triggered, _ = build_leader_frames_surge(minute_close, minute_suspend, threshold=0.02, window_bars=5)
+
+        checked = 0
+        for leader, _ in pairs:
+            trig_times = triggered[leader][triggered[leader]].index
+            self.assertGreater(len(trig_times), 0)
+            for t in trig_times:
+                pos = minute_close.index.get_loc(t)
+                past = minute_close[leader].iloc[pos - 5]
+                self.assertGreaterEqual(minute_close[leader].iloc[pos] / past - 1, 0.02)
+                checked += 1
+        self.assertGreater(checked, 0)
+
+    def test_at_most_one_trigger_per_stock_per_day(self):
+        minute_close, minute_suspend, _ = make_synthetic_surge_market(
+            n_days=200, n_stocks=30, n_pairs=5, seed=1
+        )
+        triggered, _ = build_leader_frames_surge(minute_close, minute_suspend, threshold=0.02, window_bars=5)
+        per_day = triggered.groupby(triggered.index.normalize()).sum()
+        self.assertLessEqual(per_day.max().max(), 1)
+
+    def test_uninvolved_stocks_never_trigger_by_noise(self):
+        minute_close, minute_suspend, pairs = make_synthetic_surge_market(
+            n_days=200, n_stocks=30, n_pairs=5, seed=1
+        )
+        triggered, _ = build_leader_frames_surge(minute_close, minute_suspend, threshold=0.02, window_bars=5)
+        involved = set(dict(pairs).keys()) | set(dict(pairs).values())
+        uninvolved = [c for c in minute_close.columns if c not in involved]
+        self.assertEqual(int(triggered[uninvolved].to_numpy().sum()), 0)
+
+    def test_recovers_injected_pairs_with_a_sector_map(self):
+        minute_close, minute_suspend, pairs = make_synthetic_surge_market(
+            n_days=400, n_stocks=40, n_pairs=6, lag_bars=6, threshold=0.02, window_bars=5,
+            trigger_prob=0.12, flip_prob=0.6, boost=0.02, seed=3,
+        )
+        # put each injected pair in its own sector, everything else elsewhere, so the
+        # sector mask must keep the true pairs and can only drop noise
+        sector_map = {}
+        for i, (leader, follower) in enumerate(pairs):
+            sector_map[leader] = sector_map[follower] = f"SW1_{i}"
+        for code in minute_close.columns:
+            sector_map.setdefault(code, "SW1_OTHER")
+
+        leader_triggered, leader_valid = build_leader_frames_surge(
+            minute_close, minute_suspend, threshold=0.02, window_bars=5
+        )
+        follower_outcome, follower_valid = build_follower_frames(
+            minute_close, minute_suspend, lag_bars=6, mode="absolute"
+        )
+        cfg = MiningConfig(lag=6, min_obs=15, min_lift=0.03)
+        split = int(len(minute_close) * 0.7)
+        train, test = slice(0, split), slice(split, None)
+
+        stats = compute_pairwise_stats_same_row(
+            leader_triggered.iloc[train], leader_valid.iloc[train],
+            follower_outcome.iloc[train], follower_valid.iloc[train], cfg, sector_map,
+        )
+        for row in stats.itertuples(index=False):
+            self.assertEqual(sector_map[row.leader], sector_map[row.follower])
+
+        candidates = select_top_n_candidates(stats, cfg, top_n=40)
+        validated = validate_out_of_sample_same_row(
+            leader_triggered.iloc[test], leader_valid.iloc[test],
+            follower_outcome.iloc[test], follower_valid.iloc[test], candidates, cfg,
+        )
+        deployable = select_for_deployment(
+            filter_oos_significant(validated, alpha=0.1, min_oos_n=5), max_unique_symbols=500, min_oos_n=5
+        )
+        recovered = set(zip(deployable["leader"], deployable["follower"])) & set(pairs)
+        self.assertGreaterEqual(len(recovered), len(pairs) // 2)
 
 
 class TestThresholdDetector(unittest.TestCase):

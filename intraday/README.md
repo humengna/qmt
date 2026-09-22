@@ -1,4 +1,20 @@
-# 盘中涨停触发 - 同日板块跟涨策略
+# 盘中触发 - 同日板块跟涨策略
+
+**两种 leader 触发定义**（`run_intraday_mining.py --trigger`）：
+
+| `--trigger` | 定义 | 幅度可调？ |
+|---|---|---|
+| `limitup`（默认） | 当日首次触及涨停价 | ❌ 由板制决定 |
+| `surge`（急拉） | 最近 `--surge-window` 根K线内首次涨到 `--leader-threshold` | ✅ **幅度和时间窗口都是参数** |
+
+`surge` 和"从开盘累计涨X%"是不同的东西：一只票4小时磨上去3%不算急拉，10分钟
+拉上去3%才算，而板块跟风恰恰是被**陡峭度**引发的。回看窗口不跨交易日，所以隔夜
+跳空永远不算急拉，每天每票最多触发一次。
+
+> **⚠️ T+1：个股当天买入不能卖出**，所以本目录回测建模的"同日平仓"对A股个股
+> **不可执行**。挖掘本身仍是有效的研究（而且盘中触发是比任何日线信号都更精确的
+> **入场**时点），但要落地必须改成持有到次日再卖。T+0 品种是另一回事，见
+> `research/run_etf_mining.py`——不过那条假设已因其它原因被否定。
 
 `limitup/`（次日开盘版）的盘中版本："某只龙头股当日某根 K 线首次触及涨停价后，
 同板块内某只跟随股在之后 `lag_bars` 根 K 线内（**同一交易日**）上涨的概率，
@@ -280,6 +296,12 @@ K 线。在把这套东西指向全市场、跑好几年历史之前：
 python research/run_intraday_mining.py --source synthetic --min-obs 15 \
     --candidate-mode top-n --top-n 40 --output research/output/intraday_pairs.csv
 python research/run_intraday_backtest.py --pairs research/output/intraday_pairs.csv --source synthetic
+
+# 急拉触发版：同上，触发换成"5根K线内涨2%"
+python research/run_intraday_mining.py --source synthetic --trigger surge \
+    --leader-threshold 0.02 --surge-window 5 --min-obs 15 \
+    --candidate-mode top-n --top-n 40 --output research/output/surge_pairs.csv
+python research/run_intraday_backtest.py --pairs research/output/surge_pairs.csv --source synthetic
 
 # T0 ETF 阈值触发版：合成数据端到端跑通
 python research/run_etf_mining.py --source synthetic --min-obs 15 \
