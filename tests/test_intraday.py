@@ -673,3 +673,44 @@ class TestDataCoverageSummary(unittest.TestCase):
             out = summarize_coverage(panel)
             self.assertEqual(out["with_data"], 0)
             self.assertIsNone(out["first_bar"])
+
+
+class TestSplitResolution(unittest.TestCase):
+    """--split-date pins the train/test boundary to a real date instead of a bar
+    fraction, so two runs over different fetched ranges stay comparable."""
+
+    def _args(self, **kw):
+        from types import SimpleNamespace
+        return SimpleNamespace(train_frac=0.7, split_date=None, **kw)
+
+    def _index(self):
+        # 4 trading days x 3 bars
+        return pd.DatetimeIndex([
+            pd.Timestamp(d) + pd.Timedelta(hours=9, minutes=30) + pd.Timedelta(minutes=5 * b)
+            for d in ("2026-01-02", "2026-01-05", "2026-07-01", "2026-07-02") for b in range(3)
+        ])
+
+    def test_splits_at_the_first_bar_on_or_after_the_date(self):
+        from research.run_intraday_mining import resolve_split
+
+        idx = self._index()
+        args = self._args()
+        args.split_date = "20260701"
+        split = resolve_split(idx, args)
+        self.assertEqual(split, 6)
+        self.assertEqual(str(idx[split - 1].date()), "2026-01-05")  # last train bar
+        self.assertEqual(str(idx[split].date()), "2026-07-01")      # first test bar
+
+    def test_falls_back_to_train_frac_without_a_date(self):
+        from research.run_intraday_mining import resolve_split
+
+        self.assertEqual(resolve_split(self._index(), self._args()), 8)
+
+    def test_a_date_outside_the_data_is_an_error_not_an_empty_side(self):
+        from research.run_intraday_mining import resolve_split
+
+        for bad in ("20200101", "20990101"):
+            args = self._args()
+            args.split_date = bad
+            with self.assertRaises(SystemExit):
+                resolve_split(self._index(), args)

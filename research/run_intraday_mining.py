@@ -139,7 +139,15 @@ def parse_args():
     p.add_argument("--min-lift", type=float, default=0.05)
     p.add_argument("--oos-alpha", type=float, default=0.05)
     p.add_argument("--min-oos-lift", type=float, default=0.0)
-    p.add_argument("--train-frac", type=float, default=0.7)
+    p.add_argument("--train-frac", type=float, default=0.7,
+                    help="fraction of BARS used for training; ignored when --split-date is given")
+    p.add_argument("--split-date", default=None,
+                    help="split train/test at an explicit date (YYYYMMDD or YYYY-MM-DD) instead "
+                         "of a bar fraction: bars before it train, bars from it on are the "
+                         "held-out test window. Prefer this when you want a specific, "
+                         "reproducible boundary - a fraction silently moves the boundary "
+                         "whenever the fetched date range changes, which makes two runs "
+                         "non-comparable without either of them looking wrong.")
     p.add_argument("--max-symbols", type=int, default=500)
     p.add_argument("--min-oos-n", type=int, default=10)
     p.add_argument("--max-leaders-per-follower", type=int, default=3,
@@ -178,6 +186,24 @@ def print_diagnostics(stats: pd.DataFrame, cfg: MiningConfig) -> None:
         print(top[["leader", "follower", "n_leader_up", "p_cond", "p_base", "lift", "z"]]
               .to_string(index=False))
     print("--- end diagnostics ---\n")
+
+
+def resolve_split(index: pd.DatetimeIndex, args) -> int:
+    """Row index where the held-out test window starts: the first bar on or after
+    --split-date, or --train-frac of the way through when no date is given.
+    """
+    if not args.split_date:
+        return int(len(index) * args.train_frac)
+
+    cutoff = pd.Timestamp(args.split_date)
+    split = int(index.searchsorted(cutoff))
+    if split <= 0 or split >= len(index):
+        raise SystemExit(
+            f"--split-date {args.split_date} leaves one side of the split empty: the fetched "
+            f"bars run {index[0]} .. {index[-1]}. Pick a date inside that range, and remember "
+            f"--start/--end decide what gets fetched in the first place."
+        )
+    return split
 
 
 def build_leader_frames_for(args, minute_close, minute_suspend, daily_close):
@@ -292,7 +318,7 @@ def main():
             print("[intraday] --source is not xtdata: cannot build a real sector map, "
                   "--all-sectors behavior is used regardless.")
 
-    split = int(len(minute_close) * args.train_frac)
+    split = resolve_split(minute_close.index, args)
     train_sl, test_sl = slice(0, split), slice(split, None)
     print(f"train window: {minute_close.index[0]} .. {minute_close.index[split - 1]} ({split} bars)")
     print(f"test window:  {minute_close.index[split]} .. {minute_close.index[-1]} "

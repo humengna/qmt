@@ -61,7 +61,10 @@ def parse_args():
     p.add_argument("--alpha", type=float, default=0.01)
     p.add_argument("--min-lift", type=float, default=0.05)
     p.add_argument("--oos-alpha", type=float, default=0.1)
-    p.add_argument("--train-frac", type=float, default=0.7)
+    p.add_argument("--train-frac", type=float, default=0.7,
+                    help="ignored when --split-date is given")
+    p.add_argument("--split-date", default=None,
+                    help="explicit train/test boundary (YYYYMMDD), passed through to each sector's run - see run_intraday_mining.py --split-date")
     p.add_argument("--min-oos-n", type=int, default=10)
     p.add_argument("--tolerance", type=float, default=0.003, help="--trigger limitup only")
     p.add_argument("--trigger", choices=["limitup", "surge"], default="limitup",
@@ -121,6 +124,7 @@ def run_one_sector(sector: str, args, out_dir: Path, log_dir: Path) -> tuple[str
         "--min-lift", str(args.min_lift),
         "--oos-alpha", str(args.oos_alpha),
         "--train-frac", str(args.train_frac),
+        *(["--split-date", args.split_date] if args.split_date else []),
         "--min-oos-n", str(args.min_oos_n),
         "--tolerance", str(args.tolerance),
         "--trigger", args.trigger,
