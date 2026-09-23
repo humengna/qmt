@@ -714,3 +714,59 @@ class TestSplitResolution(unittest.TestCase):
             args.split_date = bad
             with self.assertRaises(SystemExit):
                 resolve_split(self._index(), args)
+
+
+class TestSectorLevelLeader(unittest.TestCase):
+    """--leader-scope sector: pool every member's triggers into one sector signal, which
+    shrinks the hypothesis family and multiplies each hypothesis's sample size."""
+
+    def _frames(self):
+        from intraday.event import aggregate_triggers_by_sector
+
+        idx = pd.DatetimeIndex([
+            pd.Timestamp(d) + pd.Timedelta(hours=9, minutes=30) + pd.Timedelta(minutes=5 * b)
+            for d in ("2026-01-05", "2026-01-06") for b in range(4)
+        ])
+        # A,B in 电子; C in 银行. Day1: A fires bar0, B fires bar2 (same sector, same day).
+        # Day2: C fires bar1 only.
+        trig = pd.DataFrame(False, index=idx, columns=["A", "B", "C"])
+        trig.iloc[0, 0] = True
+        trig.iloc[2, 1] = True
+        trig.iloc[5, 2] = True
+        valid = pd.DataFrame(True, index=idx, columns=["A", "B", "C"])
+        smap = {"A": "电子", "B": "电子", "C": "银行"}
+        return trig, valid, smap, aggregate_triggers_by_sector(trig, valid, smap)
+
+    def test_columns_become_sectors_and_any_member_fires_the_sector(self):
+        trig, valid, smap, (st, sv) = self._frames()
+        self.assertEqual(list(st.columns), ["电子", "银行"])
+        self.assertTrue(st["电子"].iloc[0])   # A fired
+        self.assertTrue(st["银行"].iloc[5])   # C fired
+        self.assertTrue(sv.to_numpy().all())
+
+    def test_two_members_firing_the_same_day_is_one_sector_event(self):
+        trig, valid, smap, (st, sv) = self._frames()
+        day1 = st.index.normalize() == pd.Timestamp("2026-01-05")
+        # A at bar0 and B at bar2 both fired that day - the sector counts once
+        self.assertEqual(int(st.loc[day1, "电子"].sum()), 1)
+        self.assertTrue(st["电子"].iloc[0])
+        self.assertFalse(st["电子"].iloc[2])
+
+    def test_pooling_gives_the_sector_more_events_than_any_single_member(self):
+        trig, valid, smap, (st, sv) = self._frames()
+        self.assertGreaterEqual(int(st["电子"].sum()), int(trig["A"].sum()))
+        self.assertGreaterEqual(int(st["电子"].sum()), int(trig["B"].sum()))
+
+    def test_a_follower_is_masked_at_bars_it_triggered_itself(self):
+        from intraday.event import mask_self_triggers
+
+        trig, valid, smap, _ = self._frames()
+        outcome = pd.DataFrame(True, index=trig.index, columns=trig.columns)
+        fvalid = pd.DataFrame(True, index=trig.index, columns=trig.columns)
+        masked_outcome, masked_valid = mask_self_triggers(outcome, fvalid, trig)
+
+        # A caused the day-1 sector trigger, so A cannot be scored as following it
+        self.assertFalse(bool(masked_valid.iloc[0]["A"]))
+        self.assertFalse(bool(masked_outcome.iloc[0]["A"]))
+        # its sector-mate B did not fire at that bar and stays usable
+        self.assertTrue(bool(masked_valid.iloc[0]["B"]))

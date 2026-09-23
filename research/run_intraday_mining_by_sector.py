@@ -70,6 +70,9 @@ def parse_args():
     p.add_argument("--trigger", choices=["limitup", "surge"], default="limitup",
                     help="leader event definition, passed through to the per-sector mining "
                          "run - see run_intraday_mining.py's --trigger")
+    p.add_argument("--leader-scope", choices=["stock", "sector"], default="stock",
+                    help="passed through - 'sector' pools every member stock's triggers into "
+                         "one signal per sector. See run_intraday_mining.py --leader-scope")
     p.add_argument("--leader-threshold", type=float, default=0.02, help="--trigger surge only")
     p.add_argument("--surge-window", type=int, default=5, help="--trigger surge only")
     p.add_argument("--hold", choices=["same-day", "overnight"], default="same-day",
@@ -128,6 +131,7 @@ def run_one_sector(sector: str, args, out_dir: Path, log_dir: Path) -> tuple[str
         "--min-oos-n", str(args.min_oos_n),
         "--tolerance", str(args.tolerance),
         "--trigger", args.trigger,
+        "--leader-scope", args.leader_scope,
         "--leader-threshold", str(args.leader_threshold),
         "--surge-window", str(args.surge_window),
         "--hold", args.hold,

@@ -61,10 +61,12 @@ import pandas as pd
 
 from intraday import data as idd
 from intraday.event import (
+    aggregate_triggers_by_sector,
     build_follower_frames,
     build_follower_frames_overnight,
     build_leader_frames,
     build_leader_frames_surge,
+    mask_self_triggers,
 )
 from leadlag import data as ld
 from leadlag.factor import (
@@ -103,6 +105,17 @@ def parse_args():
                          "SIZE and the SPEED of the move are parameters. A stock that "
                          "grinds +3%% up over four hours is not a surge and does not "
                          "trigger - see intraday.data.compute_first_surge_indicator.")
+    p.add_argument("--leader-scope", choices=["stock", "sector"], default="stock",
+                    help="what a leader IS. 'stock': every stock is its own leader, giving "
+                         "(N x N) hypotheses each with that one stock's events. 'sector': the "
+                         "leader is the SECTOR - it fires when any member stock does, all "
+                         "members' events pooled into one signal. That collapses the family "
+                         "from (N x N) to (1 x N) AND multiplies each hypothesis's sample "
+                         "size, which is the only way a short date range supports a test at "
+                         "all; the cost is a more diffuse signal, so expect a smaller lift - "
+                         "check it against your round-trip cost before believing it is "
+                         "tradeable. Followers are masked out at bars where they triggered "
+                         "themselves, so this never measures a stock predicting itself.")
     p.add_argument("--leader-threshold", type=float, default=0.02,
                     help="--trigger surge only: the rise that counts as a surge (default 2%%)")
     p.add_argument("--surge-window", type=int, default=5,
@@ -338,12 +351,36 @@ def main():
             minute_close, minute_suspend, lag_bars=args.lag_bars, mode=args.mode, threshold=args.threshold
         )
 
+    if args.leader_scope == "sector":
+        if sector_map is None:
+            raise SystemExit(
+                "--leader-scope sector needs a sector map, but none was built (--all-sectors, "
+                "or a --source other than xtdata). The leader IS the sector here, so there is "
+                "nothing to aggregate over without one."
+            )
+        # mask BEFORE aggregating: a stock that triggered its own sector must not be
+        # scored as a follower of the move it caused (that is momentum, not spillover)
+        follower_outcome_full, follower_valid_full = mask_self_triggers(
+            follower_outcome_full, follower_valid_full, leader_triggered_full
+        )
+        n_stock_triggers = int(leader_triggered_full.iloc[train_sl].to_numpy().sum())
+        leader_triggered_full, leader_valid_full = aggregate_triggers_by_sector(
+            leader_triggered_full, leader_valid_full, sector_map
+        )
+        # the leader's "code" is now a sector name, so it must map to itself for the
+        # same-sector mask in compute_pairwise_stats_same_row to line up
+        sector_map = {**sector_map, **{s: s for s in leader_triggered_full.columns}}
+        print(f"leader scope = sector: pooled {n_stock_triggers} per-stock train events into "
+              f"{leader_triggered_full.shape[1]} sector signal(s) "
+              f"({int(leader_triggered_full.iloc[train_sl].to_numpy().sum())} sector-days after "
+              f"once-per-day dedup); followers masked at bars they triggered themselves")
+
     total_triggers = int(leader_triggered_full.iloc[train_sl].to_numpy().sum())
     event_label = (f"+{args.leader_threshold:.1%}-in-{args.surge_window}-bar surge"
                    if args.trigger == "surge" else "first-touch-limit")
     hold_label = (f"held to the next day's {args.exit_at}" if args.hold == "overnight"
                   else f"held {args.lag_bars} bars, same session (T+1: NOT executable on stocks)")
-    print(f"mining {leader_triggered_full.shape[1]} symbols x {split} train bars "
+    print(f"mining {leader_triggered_full.shape[1]} {'sector' if args.leader_scope == 'sector' else 'symbol'} leader(s) x {split} train bars "
           f"({total_triggers} total {event_label} events across the universe) "
           f"{'(same-sector pairs only)' if sector_map else ''}; follower outcome = {hold_label}...")
 
@@ -401,6 +438,7 @@ def main():
         "hold": args.hold,
         "exit_at": args.exit_at,
         "trigger": args.trigger,
+        "leader_scope": args.leader_scope,
         "leader_threshold": args.leader_threshold,
         "surge_window": args.surge_window,
         "tolerance": args.tolerance,

@@ -66,6 +66,65 @@ def build_leader_frames_threshold(
     return triggered, valid
 
 
+def aggregate_triggers_by_sector(
+    stock_triggered: pd.DataFrame, stock_valid: pd.DataFrame, sector_map: dict[str, str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Collapse per-STOCK leader triggers into per-SECTOR ones: sector S fires at bar t if
+    ANY of its member stocks fired at t. Returns panels whose COLUMNS ARE SECTOR NAMES.
+
+    This trades a sharper signal for far more of it, and is the right shape when the
+    hypothesis is "this sector is moving" rather than "this particular bellwether leads
+    that particular follower":
+
+      - every member's events are pooled, so one hypothesis has thousands of observations
+        instead of the few dozen a single stock accumulates in a short window;
+      - the family shrinks from (N leaders x N followers) to (1 x N), which drops the
+        multiple-testing bar substantially - with ~500 stocks in a sector that is 250k
+        hypotheses versus 500.
+
+    Deduped to at most one trigger per sector per day, the same way the per-stock
+    detectors are: a sector where six stocks rip in the same session is one event, not
+    six, or the pooled trigger count would just measure how broad the move was.
+
+    A sector is `valid` at a bar when any member is - i.e. the sector is observable.
+
+    IMPORTANT: pair this with `mask_self_triggers`. Without it, a stock that triggered its
+    own sector is still measured as a follower of that trigger, which is the stock
+    predicting itself (momentum), not spillover.
+    """
+    codes = [c for c in stock_triggered.columns if sector_map.get(c)]
+    sectors = sorted({sector_map[c] for c in codes})
+    dates = stock_triggered.index.normalize()
+
+    triggered, valid = {}, {}
+    for sector in sectors:
+        members = [c for c in codes if sector_map[c] == sector]
+        any_fired = stock_triggered[members].any(axis=1)
+        cum = any_fired.groupby(dates).cumsum()
+        triggered[sector] = any_fired & (cum == 1)
+        valid[sector] = stock_valid[members].any(axis=1)
+
+    return (pd.DataFrame(triggered, index=stock_triggered.index),
+            pd.DataFrame(valid, index=stock_triggered.index))
+
+
+def mask_self_triggers(
+    follower_outcome: pd.DataFrame, follower_valid: pd.DataFrame, stock_triggered: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Mark a follower invalid at any bar where IT was one of the stocks that triggered.
+
+    Required with `aggregate_triggers_by_sector`: the sector-level leader includes the
+    follower itself, so without this a stock that just surged would be counted as
+    "following" the sector move it caused - measuring its own momentum, not spillover.
+
+    This also drops bars where a DIFFERENT member triggered simultaneously, which loses a
+    little data but errs on the conservative side.
+    """
+    fired = stock_triggered.reindex(columns=follower_valid.columns, fill_value=False).astype(bool)
+    valid = follower_valid & ~fired
+    return follower_outcome & valid, valid
+
+
 def build_follower_frames(
     minute_close: pd.DataFrame, minute_suspend: pd.DataFrame, lag_bars: int,
     mode: str = "absolute", threshold: float = 0.0,
