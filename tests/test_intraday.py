@@ -634,3 +634,42 @@ class TestIntradayBacktest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDataCoverageSummary(unittest.TestCase):
+    """Pure summariser behind research/check_data_coverage.py - the pre-flight check for
+    whether a --no-download run can actually see anything."""
+
+    def _panel(self, cols):
+        idx = pd.date_range("2026-01-05 09:35", periods=4, freq="5min")
+        return pd.DataFrame(cols, index=idx)
+
+    def test_reports_range_and_counts_for_cached_symbols(self):
+        from research.check_data_coverage import summarize_coverage
+
+        out = summarize_coverage(self._panel({
+            "A.SH": [1.0, 2.0, 3.0, 4.0],
+            "B.SH": [1.0, None, 3.0, None],
+        }))
+        self.assertEqual(out["with_data"], 2)
+        self.assertEqual(out["median_bars"], 3)
+        self.assertEqual(out["first_bar"], "2026-01-05 09:35:00")
+        self.assertEqual(out["last_bar"], "2026-01-05 09:50:00")
+
+    def test_symbols_with_no_cached_bars_are_not_counted(self):
+        from research.check_data_coverage import summarize_coverage
+
+        out = summarize_coverage(self._panel({
+            "HAS.SH": [1.0, 2.0, None, None],
+            "EMPTY.SH": [None, None, None, None],
+        }))
+        self.assertEqual(out["with_data"], 1)
+        self.assertEqual(out["last_bar"], "2026-01-05 09:40:00")
+
+    def test_completely_empty_cache_reports_nothing(self):
+        from research.check_data_coverage import summarize_coverage
+
+        for panel in (None, pd.DataFrame(), self._panel({"X.SH": [None]*4})):
+            out = summarize_coverage(panel)
+            self.assertEqual(out["with_data"], 0)
+            self.assertIsNone(out["first_bar"])
