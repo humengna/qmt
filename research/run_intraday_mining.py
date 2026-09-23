@@ -260,6 +260,18 @@ def load_panels(args):
                 f"real trading days and that this period's history is downloaded locally "
                 f"(drop --no-download, or use QMT's 数据管理)."
             )
+        if args.trigger == "limitup" and (daily_close is None or daily_close.empty
+                                          or not daily_close.notna().to_numpy().any()):
+            raise SystemExit(
+                "--trigger limitup needs DAILY bars to derive each day's limit price from the "
+                "prior close, and none came back. xtdata caches 1d separately from "
+                f"{args.period}, so having minute history does NOT mean the daily history is "
+                "there. Without this the limit price is NaN, every bar is marked invalid, and "
+                "the run would just report 0 trigger events. Check the daily cache with\n"
+                f"    python research/check_data_coverage.py --period 1d --start {args.start or '20230103'}\n"
+                "then drop --no-download to fetch it, or use --trigger surge, which needs no "
+                "daily bars at all."
+            )
         return minute_close, minute_suspend, daily_close, stock_list
     raise SystemExit(f"unknown source {args.source}")
 
